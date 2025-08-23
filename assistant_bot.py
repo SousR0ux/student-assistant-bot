@@ -220,7 +220,6 @@ async def call_gemini(prompt: str) -> str:
         f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     )
 
-    # ВАЖНО: правильные скобки!
     payload = {
         "contents": [
             {
@@ -286,7 +285,7 @@ def cabinet_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🗂 История (10)", callback_data="cab_history")],
         [InlineKeyboardButton("📥 Экспорт истории (CSV)", callback_data="cab_export")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="cab_settings")],
-        [InlineKeyboardButton("👥 Рефералы", callback_data="cab_ref")],  # ← добавили кнопку
+        [InlineKeyboardButton("👥 Рефералы", callback_data="cab_ref")],
         [InlineKeyboardButton("🔥 Получить безлимит", url="https://t.me/V_L_A_D_IS_L_A_V")],
         [InlineKeyboardButton("🔄 Обновить", callback_data="cab_refresh")],
         [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_main_menu")],
@@ -518,7 +517,6 @@ async def reset_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # ===== add_subscription =====
 async def add_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """(Только для админа) Добавляет или продлевает подписку пользователю на N дней."""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Только администратор.")
         return
@@ -1009,6 +1007,14 @@ def _next_reset_str() -> str:
     tomorrow = datetime.now().date() + timedelta(days=1)
     return f"{tomorrow.strftime('%d.%m.%Y')} 00:00"
 
+async def _get_bot_username(app: Application) -> str:
+    name = app.bot_data.get("bot_username")
+    if name:
+        return name
+    me = await app.bot.get_me()
+    app.bot_data["bot_username"] = me.username
+    return me.username
+
 async def cabinet_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
     used_rew = get_user_usage("rewriter", context)
@@ -1066,34 +1072,28 @@ async def cabinet_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.callback_query.message.reply_document(InputFile(byte), caption="История (CSV)")
     return CABINET_MENU
 
-# === REFERRALS SCREEN ===
-async def cabinet_ref(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.callback_query:
-        await update.callback_query.answer()
-        msg = update.callback_query.message
-    else:
-        msg = update.effective_message
-
-    refs = context.user_data.get("referrals", set())
-    try:
-        ref_count = len(refs) if isinstance(refs, set) else len(set(refs or []))
-    except Exception:
-        ref_count = 0
-
-    me = await context.bot.get_me()
-    bot_username = me.username or "YourBot"
+# ===== REFERRALS (ЛК) =====
+async def cabinet_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.callback_query.answer()
     uid = update.effective_user.id
+    refs = context.user_data.get("referrals", set())
+    count = len(refs) if isinstance(refs, set) else 0
+    bot_username = await _get_bot_username(context.application)
     link = f"https://t.me/{bot_username}?start={uid}"
+    bonus = REF_BONUS_DAYS
 
-    text = (
-        "👥 *Реферальная программа*\n\n"
-        f"Ваша ссылка для приглашений:\n{link}\n\n"
-        f"Приведено друзей: *{ref_count}*\n"
-        f"Бонус рефереру: *+{REF_BONUS_DAYS} дн.* безлимита за каждого\n"
-        f"Новому пользователю: *{REF_WELCOME_ATTEMPTS}* доп. попыток сегодня"
+    txt = (
+        "👥 <b>Рефералы</b>\n\n"
+        f"Ваша персональная ссылка:\n<code>{html.escape(link)}</code>\n\n"
+        f"За каждого приглашённого вы получаете <b>+{bonus} дн.</b> безлимита.\n"
+        f"Сейчас у вас: <b>{count}</b> реферал(ов).\n\n"
+        "Совет: отправьте ссылку друзьям или разместите в профиле/канале."
     )
-    await msg.edit_text(text, parse_mode="Markdown",
-                        reply_markup=cabinet_kb(), disable_web_page_preview=True)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Назад", callback_data="cabinet")],
+        [InlineKeyboardButton("Поделиться ссылкой", url=link)]
+    ])
+    await update.callback_query.message.edit_text(txt, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
     return CABINET_MENU
 
 # SETTINGS
@@ -1287,7 +1287,6 @@ async def literature_process_topic(update: Update, context: ContextTypes.DEFAULT
     context.user_data["last_request"] = {"feature":"literature","len":len(topic),"ts":datetime.now().isoformat()}
     processing = await update.message.reply_text("📚 Подбираю источники…")
 
-    # Новый промпт: нумерация + комментарий
     prompt = (
         "Ты — AI-эксперт-библиограф. Составь НУМЕРОВАННЫЙ список 5–7 актуальных источников на русском.\n"
         "Для каждого укажи точную библиографию и КОРОТКИЙ комментарий (1–2 предложения), зачем источник полезен.\n"
@@ -1387,7 +1386,7 @@ def main() -> None:
                 CallbackQueryHandler(cabinet_export, pattern="^cab_export$"),
                 CallbackQueryHandler(cabinet_refresh, pattern="^cab_refresh$"),
                 CallbackQueryHandler(settings_open, pattern="^cab_settings$"),
-                CallbackQueryHandler(cabinet_ref, pattern="^cab_ref$"),  # ← подключили экран рефералов
+                CallbackQueryHandler(cabinet_referrals, pattern="^cab_ref$"),
                 CallbackQueryHandler(start, pattern="^back_to_main_menu$"),
             ],
             CAPTCHA_WAIT: [

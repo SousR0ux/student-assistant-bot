@@ -219,7 +219,17 @@ async def call_gemini(prompt: str) -> str:
         f"https://generativelanguage.googleapis.com/v1/models/"
         f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     )
-    payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
+
+    # ВАЖНО: правильные скобки!
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}]
+            }
+        ]
+    }
+
     try:
         from httpx import AsyncClient, HTTPStatusError
         async with AsyncClient(timeout=60.0) as client:
@@ -276,6 +286,7 @@ def cabinet_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🗂 История (10)", callback_data="cab_history")],
         [InlineKeyboardButton("📥 Экспорт истории (CSV)", callback_data="cab_export")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="cab_settings")],
+        [InlineKeyboardButton("👥 Рефералы", callback_data="cab_ref")],  # ← добавили кнопку
         [InlineKeyboardButton("🔥 Получить безлимит", url="https://t.me/V_L_A_D_IS_L_A_V")],
         [InlineKeyboardButton("🔄 Обновить", callback_data="cab_refresh")],
         [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_main_menu")],
@@ -569,7 +580,7 @@ async def del_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     if has_active_subscription(context):
-        exp = datetime.strptime(context.user_data.get("subscription_expires"), "%Y-%m-%d").strftime("%d.%м.%Y")
+        exp = datetime.strptime(context.user_data.get("subscription_expires"), "%Y-%m-%d").strftime("%d.%m.%Y")
         await update.message.reply_html(f"<b>Статус:</b> ✅ Безлимит до {exp}")
     else:
         r = remaining_attempts("rewriter", context, uid)
@@ -691,7 +702,7 @@ async def admin_status_receive_id(update: Update, context: ContextTypes.DEFAULT_
     if not ud:
         await update.message.reply_text("Пользователь не найден.", reply_markup=admin_cancel_kb()); return ADMIN_MENU
     exp = ud.get("subscription_expires")
-    sub_line = f"Подписка: до {datetime.strptime(exp,'%Y-%m-%d').strftime('%d.%м.%Y')}" if exp else "Подписка: нет"
+    sub_line = f"Подписка: до {datetime.strptime(exp,'%Y-%m-%d').strftime('%d.%m.%Y')}" if exp else "Подписка: нет"
     usage = ud.get("usage", {})
     rew = usage.get("rewriter", {"count": 0, "date": _today()})
     lit = usage.get("literature", {"count": 0, "date": _today()})
@@ -1055,6 +1066,36 @@ async def cabinet_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.callback_query.message.reply_document(InputFile(byte), caption="История (CSV)")
     return CABINET_MENU
 
+# === REFERRALS SCREEN ===
+async def cabinet_ref(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+        msg = update.callback_query.message
+    else:
+        msg = update.effective_message
+
+    refs = context.user_data.get("referrals", set())
+    try:
+        ref_count = len(refs) if isinstance(refs, set) else len(set(refs or []))
+    except Exception:
+        ref_count = 0
+
+    me = await context.bot.get_me()
+    bot_username = me.username or "YourBot"
+    uid = update.effective_user.id
+    link = f"https://t.me/{bot_username}?start={uid}"
+
+    text = (
+        "👥 *Реферальная программа*\n\n"
+        f"Ваша ссылка для приглашений:\n{link}\n\n"
+        f"Приведено друзей: *{ref_count}*\n"
+        f"Бонус рефереру: *+{REF_BONUS_DAYS} дн.* безлимита за каждого\n"
+        f"Новому пользователю: *{REF_WELCOME_ATTEMPTS}* доп. попыток сегодня"
+    )
+    await msg.edit_text(text, parse_mode="Markdown",
+                        reply_markup=cabinet_kb(), disable_web_page_preview=True)
+    return CABINET_MENU
+
 # SETTINGS
 async def settings_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
@@ -1237,7 +1278,7 @@ async def literature_process_topic(update: Update, context: ContextTypes.DEFAULT
     if not is_admin(uid) and not has_active_subscription(context):
         if get_user_usage("literature", context) >= FREE_LIMIT:
             await update.message.reply_html(
-                ("🚫 <b>Дневной лимит исчерпан</б>\n\n"
+                ("🚫 <b>Дневной лимит исчерпан</b>\n\n"
                  "Хотите продолжить без ожидания? Напишите: <a href='https://t.me/V_L_A_D_IS_L_A_V'>@V_L_A_D_IS_L_A_V</a>\n"
                  f"Ваш ID: <code>{uid}</code>"), reply_markup=contact_kb())
             return LITERATURE_TOPIC_INPUT
@@ -1346,6 +1387,7 @@ def main() -> None:
                 CallbackQueryHandler(cabinet_export, pattern="^cab_export$"),
                 CallbackQueryHandler(cabinet_refresh, pattern="^cab_refresh$"),
                 CallbackQueryHandler(settings_open, pattern="^cab_settings$"),
+                CallbackQueryHandler(cabinet_ref, pattern="^cab_ref$"),  # ← подключили экран рефералов
                 CallbackQueryHandler(start, pattern="^back_to_main_menu$"),
             ],
             CAPTCHA_WAIT: [

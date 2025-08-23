@@ -214,19 +214,36 @@ def _feature_usage_today(bd: dict) -> Dict[str, int]:
     return {"rewriter": int(fm.get("rewriter", 0)), "literature": int(fm.get("literature", 0))}
 
 # ===== Gemini =====
+# ===== Gemini =====
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+
 async def call_gemini(prompt: str) -> str:
     if not GEMINI_API_KEY:
         return "Ошибка: API-ключ для нейросети не настроен."
-    api_url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-               "gemini-2.5-flash-preview-05-20:generateContent"
-               f"?key={GEMINI_API_KEY}")
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-
+    # v1 эндпоинт и актуальная модель
+    api_url = (
+        "https://generativelanguage.googleapis.com/v1/models/"
+        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+    payload = {
+        "contents": [
+            {"role": "user", "parts": [{"text": prompt}]}
+        ]
+    }
     try:
-        from httpx import AsyncClient
-        async with AsyncClient() as client:
-            r = await client.post(api_url, json=payload, timeout=60.0)
-            r.raise_for_status()
+        from httpx import AsyncClient, HTTPStatusError
+        async with AsyncClient(timeout=60.0) as client:
+            r = await client.post(api_url, json=payload)
+            try:
+                r.raise_for_status()
+            except HTTPStatusError:
+                # Вернём текстовую ошибку от Google, чтобы её было видно в Telegram
+                try:
+                    err = r.json().get("error", {})
+                    msg = err.get("message") or str(err)
+                except Exception:
+                    msg = r.text
+                return f"Произошла ошибка при обращении к нейросети: {r.status_code} {msg}"
             j = r.json()
             cand = j.get("candidates", [])
             if cand and cand[0].get("content", {}).get("parts"):
@@ -234,6 +251,7 @@ async def call_gemini(prompt: str) -> str:
             return "Не удалось получить корректный ответ от AI. Попробуйте позже."
     except Exception as e:
         return f"Произошла ошибка при обращении к нейросети: {e}"
+
 
 def _no_literature_found(txt: str) -> bool:
     s = (txt or "").strip()

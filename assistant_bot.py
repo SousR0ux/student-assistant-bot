@@ -69,7 +69,7 @@ logger = logging.getLogger(__name__)
     ADMIN_METRICS_MENU,
     FILE_REWRITE_WAIT_FILE,
     ADMIN_ADDSUB_FILE_WAIT_ID, ADMIN_ADDSUB_FILE_WAIT_DAYS, ADMIN_MAINT_MSG_WAIT
-) = range(28)
+) = range(29)
 
 # ===== HELPERS: dates/roles =====
 def _today() -> str: return datetime.now().strftime("%Y-%m-%d")

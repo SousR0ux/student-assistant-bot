@@ -1,209 +1,160 @@
 # -*- coding: utf-8 -*-
+
 from __future__ import annotations
 
 import io
-import json
+import re
 from dataclasses import dataclass
-from typing import List, Tuple, Callable, Awaitable, TYPE_CHECKING, Any
+from typing import List, Tuple, Callable, Awaitable, TYPE_CHECKING, Any, Dict
 
-# ----- Безопасные типы для подсказок (не ломают Pylance) -----
-if TYPE_CHECKING:
-    from docx.document import Document as DocxDocument
-    from docx.text.run import Run
-else:
-    DocxDocument = Any
-    Run = Any
-
-# ----- python-docx -----
+# --- Опциональный импорт python-docx (чтобы не падать на типизации в редакторе) ---
 try:
     import docx  # type: ignore
     from docx.enum.text import WD_COLOR_INDEX  # type: ignore
-except ImportError:
+except Exception:  # библиотека может быть не установлена в среде проверки типов
     docx = None            # type: ignore
     WD_COLOR_INDEX = None  # type: ignore
 
+if TYPE_CHECKING:
+    from docx.document import Document as DocxDocument  # type: ignore
+    from docx.text.run import Run  # type: ignore
+else:
+    DocxDocument = Any  # безопасная подстановка, чтобы Pylance не ругался
+    Run = Any
 
-# ===================== DATA CLASSES =====================
+
+# =========================
+#        МОДЕЛИ
+# =========================
 
 @dataclass
 class HighlightedPart:
-    original_text: str
+    """
+    Один выделенный (подсвеченный) пользователем фрагмент документа.
+    aggregated_text  — исходный текст фрагмента (в порядке прохождения Run-ов).
+    run_indices      — список пар (p_idx, r_idx) того, в каких параграфах/раннах лежал текст.
+    """
+    aggregated_text: str
     part_index: int
-    run_indices: List[Tuple[int, int]]  # (paragraph_idx, run_idx)
+    run_indices: List[Tuple[int, int]]
+
 
 @dataclass
 class RewrittenPart:
+    """Результат рерайта для одного HighlightedPart."""
     rewritten_text: str
     original_part: HighlightedPart
 
 
-# ===================== INTERNAL HELPERS =====================
-
-def _require_docx() -> None:
-    if docx is None:  # pragma: no cover
-        raise RuntimeError("Библиотека python-docx не установлена. Выполните: pip install python-docx")
+# =========================
+#     ВСПОМОГАТЕЛЬНОЕ
+# =========================
 
 def _is_yellow_highlight(run: Run) -> bool:
+    """Проверка, что у ранна жёлтая подсветка. Защита от отсутствия атрибута."""
     try:
-        h = run.font.highlight_color
-        if h is None:
-            return False
-        if WD_COLOR_INDEX is not None:
-            try:
-                return h == WD_COLOR_INDEX.YELLOW  # type: ignore[attr-defined]
-            except Exception:
-                pass
-        if hasattr(h, "value"):
-            return int(h.value) == 7
-        if isinstance(h, int):
-            return h == 7
-        return str(h).upper().endswith("YELLOW")
+        return getattr(run.font, "highlight_color", None) == getattr(WD_COLOR_INDEX, "YELLOW", None)
     except Exception:
         return False
 
-def _chunk_text(text: str, max_chars: int = 8000) -> List[str]:
-    t = (text or "").strip()
-    if not t:
-        return []
-    if len(t) <= max_chars:
-        return [t]
-    return [t[i:i + max_chars] for i in range(0, len(t), max_chars)]
 
-def _clean_output(s: str) -> str:
-    """Фильтр на случай, если модель прислала разметку/префиксы."""
-    s = (s or "").strip()
-    # часто встречающееся «обрамление»
-    if s.startswith("```") and s.endswith("```"):
-        s = s[3:-3].strip()
+def _chunk_text(text: str, max_chars: int = 8000) -> List[str]:
+    """Ровняем по кускам, чтобы не превышать лимиты модели."""
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text]
+    return [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+
+
+def _build_prompt(chunk: str, tone: str, target_uniqueness: str, deep_analyze: bool = True) -> str:
+    """Жёсткий промпт: анализ смысла + запрет на подмену категорий и фактов."""
+    uniq_line = f"Цель по уникальности (антиплагиат): {target_uniqueness}.\n" if target_uniqueness else ""
+    analyze = (
+        "<self_reflection>\n"
+        "1) Подумай, какие требования к идеальному академическому перефразированию важны.\n"
+        "2) Внутренне оцени результат по 6 критериям: точность смысла, сохранение категорий/терминов, "
+        "отсутствие новых фактов, структурное соответствие (1↔1 по предложениям), связность, естественность стиля.\n"
+        "3) Если какой-либо критерий не выполнен, перепиши свой ответ до соответствия.\n"
+        "</self_reflection>\n\n"
+        if deep_analyze else ""
+    )
+    return (
+        "Ты — опытный академический редактор. Твоя задача — осторожно перефразировать текст "
+        "без искажения смысла и без добавления фактов.\n\n"
+        "<rules>\n"
+        "- Переписывай СТРОГО предложение-за-предложением: на каждое входное предложение — одно переписанное.\n"
+        "- Не меняй категории и заголовки: «Актуальность», «Цель курсовой работы», «Объект исследования», "
+        "«Предмет исследования», «Задачи» и т. п. НЕЛЬЗЯ заменять «цель» на «предмет» и наоборот.\n"
+        "- Сохраняй имена, цифры, хронологию, термины. Ничего не выдумывай и не добавляй.\n"
+        f"- Стиль: {tone}. Объём каждого предложения ~0.8–1.2 от исходного.\n"
+        "- Не пиши никаких комментариев, пояснений, списков правил и т. д. Выводи только перефразированный текст.\n"
+        f"- {uniq_line}"
+        "</rules>\n\n"
+        f"{analyze}"
+        "ТЕКСТ ДЛЯ РЕРАЙТА:\n"
+        f"\"\"\"\n{chunk}\n\"\"\"\n\n"
+        "ВЫВОД: только перефразированный текст без меток и комментариев."
+    )
+
+
+def _clean_model_text(s: str) -> str:
+    """Убираем маркдауны/обёртки, лишние пробелы."""
+    s = s.strip()
+    # удаляем возможные бэктики/код-блоки
     s = s.strip("`").strip()
-    # вырезаем типичные маркёры
-    for bad in ("**TL;DR**", "TL;DR", "**Ответ:**", "Ответ:", "Вывод:", "Переписанный текст:", "Рерайт:"):
-        s = s.replace(bad, "")
+    # нормализуем множественные пробелы
+    s = re.sub(r"[ \t]+", " ", s)
+    # убираем пробелы перед знаками препинания
+    s = re.sub(r"\s+([,.;:!?])", r"\1", s)
     return s.strip()
 
-def _build_analyze_prompt(chunk: str, tone: str) -> str:
-    return (
-        "Ты — опытный научный редактор.\n"
-        "ШАГ 1 (внутренний анализ, для себя): извлеки ключевые тезисы и термины из фрагмента.\n"
-        "Верни строго JSON без комментариев в формате:\n"
-        "{\n"
-        '  "key_points": ["тезис1", "тезис2", ...],\n'
-        '  "terms": ["термин1", "термин2", ...]\n'
-        "}\n\n"
-        f"Стиль целевого изложения: {tone}.\n"
-        "Текст:\n"
-        f"\"\"\"\n{chunk}\n\"\"\""
-    )
 
-def _build_rewrite_prompt(chunk: str, analysis_json: str, tone: str, target_uniqueness: str) -> str:
-    uniq = f"Цель по уникальности (антиплагиат): {target_uniqueness}.\n" if target_uniqueness else ""
-    return (
-        "Ты — академический редактор. Сначала молча используй анализ ниже для понимания смысла, "
-        "но НИКОГДА его не цитируй и не упоминай. Затем перепиши исходный текст.\n\n"
-        "АНАЛИЗ (JSON, только для внутреннего использования):\n"
-        f"{analysis_json}\n\n"
-        "ТРЕБОВАНИЯ К РЕРАЙТУ:\n"
-        f"- стиль: {tone};\n"
-        "- сохраняй исходные факты, числа, определения, цитаты в «…» не перефразируй;\n"
-        "- не добавляй информации, которой нет в исходнике; не пиши вводных, выводов и пояснений;\n"
-        "- сохраняй логику и последовательность; избегай штампов и воды;\n"
-        "- длина результата ~90–110% от исходного фрагмента;\n"
-        "- сохраняй перечисления и структуру как в исходнике (если был абзац — остаётся абзац);\n"
-        f"{uniq}"
-        "ОТВЕТ:\n"
-        "Верни ТОЛЬКО перефразированный текст без маркировок, заголовков, списков или Markdown, "
-        "без слов-предисловий (например, «Переписанный текст:»)."
-        "\n\n"
-        "ИСХОДНЫЙ ТЕКСТ:\n"
-        f"\"\"\"\n{chunk}\n\"\"\""
-    )
-
-def _build_single_pass_prompt(chunk: str, tone: str, target_uniqueness: str) -> str:
-    uniq = f"Цель по уникальности (антиплагиат): {target_uniqueness}.\n" if target_uniqueness else ""
-    return (
-        "Ты — академический редактор. Сначала молча проанализируй смысл, затем перепиши.\n"
-        "Не добавляй ничего сверх исходника, не пиши вступлений/выводов и комментариев.\n"
-        f"- стиль: {tone};\n"
-        "- факты/числа/термины сохраняй; цитаты в «…» не перефразируй;\n"
-        "- длина ~90–110% изначального;\n"
-        "- сохрани порядок и структуру.\n"
-        f"{uniq}"
-        "ОТВЕТ: только переписанный текст без маркировок и Markdown.\n\n"
-        "Текст для рерайта:\n"
-        f"\"\"\"\n{chunk}\n\"\"\""
-    )
-
-def _replace_text_preserving_runs(doc: DocxDocument,
-                                  indices: List[Tuple[int, int]],
-                                  new_text: str) -> None:
-    """Кладём новый текст в те же runs, не трогая формат; подсветку снимаем."""
-    if not indices:
-        return
-    runs: List[Run] = [doc.paragraphs[p].runs[r] for p, r in indices]
-    for rn in runs:
-        try:
-            rn.font.highlight_color = None
-        except Exception:
-            pass
-
-    orig_lens = [len(getattr(rn, "text", "") or "") for rn in runs]
-    total = sum(orig_lens)
-    if total == 0:
-        runs[0].text = new_text
-        for rn in runs[1:]:
-            rn.text = ""
-        return
-
-    tgt_len = len(new_text)
-    alloc: List[int] = []
-    acc = 0
-    for i, L in enumerate(orig_lens):
-        if i == len(orig_lens) - 1:
-            n = tgt_len - acc
-        else:
-            n = round(tgt_len * (L / total))
-            n = max(0, min(n, tgt_len - acc))
-        alloc.append(n)
-        acc += n
-
-    pos = 0
-    for rn, n in zip(runs, alloc):
-        rn.text = new_text[pos:pos+n]
-        pos += n
-    if pos < tgt_len:
-        runs[-1].text += new_text[pos:]
-
-
-# ===================== PUBLIC API =====================
+# =========================
+#   ОСНОВНЫЕ ФУНКЦИИ
+# =========================
 
 def process_docx_for_rewrite(file_bytes: bytes) -> Tuple[DocxDocument, List[HighlightedPart]]:
-    """Собирает непрерывные жёлтые фрагменты. Возвращает документ и список частей."""
-    _require_docx()
-    doc: DocxDocument = docx.Document(io.BytesIO(file_bytes))  # type: ignore
+    """
+    Считывает .docx, находит непрерывные последовательности Run-ов с жёлтой подсветкой
+    и возвращает документ + список выделенных фрагментов.
+    """
+    if docx is None:
+        raise RuntimeError("Библиотека python-docx не установлена. Установите: pip install python-docx")
 
+    doc: DocxDocument = docx.Document(io.BytesIO(file_bytes))  # type: ignore
     parts: List[HighlightedPart] = []
-    cur_text: str = ""
-    cur_runs: List[Tuple[int, int]] = []
-    counter = 0
+
+    current_runs: List[Tuple[int, int]] = []
+    current_text: List[str] = []
+    part_counter = 0
 
     for p_idx, p in enumerate(doc.paragraphs):
         for r_idx, run in enumerate(p.runs):
             if _is_yellow_highlight(run):
-                cur_text += run.text
-                cur_runs.append((p_idx, r_idx))
+                current_runs.append((p_idx, r_idx))
+                current_text.append(run.text or "")
             else:
-                if cur_runs:
-                    parts.append(HighlightedPart(cur_text, counter, cur_runs[:]))
-                    counter += 1
-                    cur_text, cur_runs = "", []
+                if current_runs:
+                    parts.append(
+                        HighlightedPart(
+                            aggregated_text="".join(current_text),
+                            part_index=part_counter,
+                            run_indices=current_runs[:],
+                        )
+                    )
+                    part_counter += 1
+                    current_runs.clear()
+                    current_text.clear()
 
-        if cur_runs:  # разрыв абзаца = конец фрагмента
-            parts.append(HighlightedPart(cur_text, counter, cur_runs[:]))
-            counter += 1
-            cur_text, cur_runs = "", []
-
-    if cur_runs:  # на всякий
-        parts.append(HighlightedPart(cur_text, counter, cur_runs[:]))
+    # Хвост
+    if current_runs:
+        parts.append(
+            HighlightedPart(
+                aggregated_text="".join(current_text),
+                part_index=part_counter,
+                run_indices=current_runs[:],
+            )
+        )
 
     return doc, parts
 
@@ -216,60 +167,121 @@ async def rewrite_highlighted_parts_async(
     deep_analyze: bool = True,
 ) -> List[RewrittenPart]:
     """
-    Переписывает каждый выделенный фрагмент.
-    - rewrite_fn(prompt) -> str  — ваш вызов ИИ (например, call_gemini).
-    - deep_analyze=True   — двухшаговый режим: анализ JSON -> рерайт.
+    Делит исходные тексты по кускам (на случай больших фрагментов),
+    вызывает переданную функция `rewrite_fn(prompt)`, склеивает результат.
     """
-    results: List[RewrittenPart] = []
+    out: List[RewrittenPart] = []
 
     for part in parts:
-        src = (part.original_text or "").strip()
+        src = part.aggregated_text.strip()
         if not src:
             continue
 
         chunks = _chunk_text(src)
-        rewritten_acc: List[str] = []
+        rewritten_total: List[str] = []
 
         for chunk in chunks:
-            if deep_analyze:
-                # Шаг 1: анализ
-                a_prompt = _build_analyze_prompt(chunk, tone)
-                analysis = await rewrite_fn(a_prompt)
-                analysis = _clean_output(analysis)
+            prompt = _build_prompt(chunk, tone, target_uniqueness, deep_analyze=deep_analyze)
+            resp = await rewrite_fn(prompt)
+            rewritten_total.append(_clean_model_text(resp))
 
-                # Это должен быть JSON — но на всякий подстрахуемся
-                try:
-                    json.loads(analysis)
-                except Exception:
-                    # если пришёл не JSON, склеим безопасную болванку
-                    analysis = json.dumps({"key_points": [], "terms": []}, ensure_ascii=False)
-
-                # Шаг 2: рерайт по анализу
-                r_prompt = _build_rewrite_prompt(chunk, analysis, tone, target_uniqueness)
-                out = await rewrite_fn(r_prompt)
-            else:
-                # Однопроходный рерайт
-                r_prompt = _build_single_pass_prompt(chunk, tone, target_uniqueness)
-                out = await rewrite_fn(r_prompt)
-
-            rewritten_acc.append(_clean_output(out))
-
-        final_text = " ".join(x for x in rewritten_acc if x).strip()
-        results.append(RewrittenPart(rewritten_text=final_text, original_part=part))
-
-    return results
-
-
-def build_final_docx(original_doc: DocxDocument,
-                     rewritten_parts: List[RewrittenPart]) -> bytes:
-    """Вставляет новый текст в те же runs; форматирование сохраняется, подсветка снимается."""
-    for part in rewritten_parts:
-        _replace_text_preserving_runs(
-            original_doc,
-            part.original_part.run_indices,
-            part.rewritten_text
+        out.append(
+            RewrittenPart(
+                rewritten_text=" ".join(rewritten_total).strip(),
+                original_part=part,
+            )
         )
+
+    return out
+
+
+def _distribute_text_by_runs(text: str, runs: List[Run]) -> List[str]:
+    """
+    Возвращает список частей `text`, распределённых по раннам пропорционально
+    их первоначальной длине. Это позволяет сохранить формат конкретных раннов
+    (жирность/курсив/капс и т. п.), не делая весь блок одним стилем.
+    """
+    if not runs:
+        return []
+
+    # исходные длины
+    lengths = [len(r.text or "") for r in runs]
+    total_len = sum(lengths)
+
+    # если все длины нулевые — просто сверху вниз
+    if total_len == 0:
+        parts = []
+        left = text
+        for i in range(len(runs) - 1):
+            parts.append("")  # ничего не было — ничего не кладём
+        parts.append(left)
+        return parts
+
+    target_total = len(text)
+    assigned: List[int] = []
+    taken = 0
+    for i, L in enumerate(lengths):
+        if i == len(lengths) - 1:
+            size = target_total - taken
+        else:
+            # доля символов
+            share = (L / total_len) * target_total
+            size = max(0, int(round(share)))
+            # не превышаем остаток
+            size = min(size, target_total - taken)
+        assigned.append(size)
+        taken += size
+
+    # Срезы текста
+    res: List[str] = []
+    pos = 0
+    for size in assigned:
+        res.append(text[pos:pos + size])
+        pos += size
+    return res
+
+
+def build_final_docx(original_doc: DocxDocument, rewritten_parts: List[RewrittenPart]) -> bytes:
+    """
+    Вставляет переписанный текст на место подсвеченных участков,
+    снимает подсветку, при этом:
+    - количество раннов и их стили сохраняются;
+    - жирность/курсив/капс/шрифт/интервалы/отступы/стили абзацев НЕ меняются.
+    """
+    # Быстрый доступ по номеру фрагмента
+    parts_map: Dict[int, RewrittenPart] = {
+        p.original_part.part_index: p for p in rewritten_parts
+    }
+
+    for part_idx in sorted(parts_map.keys()):
+        part = parts_map[part_idx]
+        indices = part.original_part.run_indices
+
+        # Собираем реальные ранны в исходном порядке
+        runs: List[Run] = []
+        for p_idx, r_idx in indices:
+            try:
+                runs.append(original_doc.paragraphs[p_idx].runs[r_idx])  # type: ignore
+            except Exception:
+                # если вдруг индекс «уехал», пропускаем
+                continue
+
+        if not runs:
+            continue
+
+        # Распределяем новый текст по этим же раннам
+        slices = _distribute_text_by_runs(part.rewritten_text, runs)
+
+        for run, new_text in zip(runs, slices):
+            # подчищаем подсветку и меняем только текст
+            try:
+                if getattr(run.font, "highlight_color", None) is not None:
+                    run.font.highlight_color = None
+            except Exception:
+                pass
+            run.text = new_text
+
     bio = io.BytesIO()
-    original_doc.save(bio)
+    original_doc.save(bio)  # type: ignore
     bio.seek(0)
     return bio.getvalue()

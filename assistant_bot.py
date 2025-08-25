@@ -10,6 +10,12 @@ from telegram.ext import (
     Application, CommandHandler, ContextTypes, ConversationHandler,
     MessageHandler, CallbackQueryHandler, filters, PicklePersistence
 )
+from telegram.helpers import escape_markdown
+from telegram.error import BadRequest
+
+# НОВЫЕ ИМПОРТЫ
+from file_rewriter import parse_document, rewrite_main_async, build_docx
+from file_utils import read_telegram_file
 
 # ===== .env / .evn =====
 try:
@@ -25,8 +31,9 @@ BOT_TOKEN        = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
 ADMIN_CHAT_ID    = os.getenv("ADMIN_CHAT_ID")
 FREE_LIMIT       = int(os.getenv("FREE_LIMIT", "5"))
-RL_WINDOW_SEC    = int(os.getenv("RL_WINDOW_SEC", "10"))  # троттлинг окно
-RL_MAX_HITS      = int(os.getenv("RL_MAX_HITS", "3"))     # макс. запросов в окне
+FILE_REWRITE_LIMIT = int(os.getenv("FILE_REWRITE_LIMIT", "1")) # 1 бесплатный рерайт файла в день
+RL_WINDOW_SEC    = int(os.getenv("RL_WINDOW_SEC", "10"))
+RL_MAX_HITS      = int(os.getenv("RL_MAX_HITS", "3"))
 CAPTCHA_ENABLED  = os.getenv("CAPTCHA_ENABLED", "1") == "1"
 
 # Рефералки
@@ -57,8 +64,9 @@ logger = logging.getLogger(__name__)
     ADMIN_BROADCAST_SEGMENT, ADMIN_BROADCAST_WAIT_TEXT,
     ADMIN_SETLIMIT_WAIT_ID, ADMIN_SETLIMIT_WAIT_VALUES,
     ADMIN_BLACKLIST_WAIT_ID, ADMIN_SHADOW_WAIT_ID,
-    ADMIN_METRICS_MENU
-) = range(25)
+    ADMIN_METRICS_MENU,
+    FILE_REWRITE_WAIT_FILE
+) = range(26)
 
 # ===== HELPERS: dates/roles =====
 def _today() -> str: return datetime.now().strftime("%Y-%m-%d")
@@ -92,18 +100,19 @@ def increment_usage(feature: str, context: ContextTypes.DEFAULT_TYPE) -> int:
         d["count"] = int(d.get("count", 0)) + 1
         d["date"] = _today()
     u[feature] = d
-    # --- аналитика по функциям ---
     app = context.application
     stat = app.bot_data.setdefault("feature_usage_today", {})
     day = _today()
-    day_map = stat.setdefault(day, {"rewriter": 0, "literature": 0})
+    day_map = stat.setdefault(day, {"rewriter": 0, "literature": 0, "file_rewrite": 0})
     day_map[feature] = day_map.get(feature, 0) + 1
     return d["count"]
 
 def remaining_attempts(feature: str, context: ContextTypes.DEFAULT_TYPE, uid: int) -> str:
     if is_admin(uid) or has_active_subscription(context):
         return "∞ (Безлимит)"
-    return str(max(0, FREE_LIMIT - get_user_usage(feature, context)))
+    
+    limit = FILE_REWRITE_LIMIT if feature == "file_rewrite" else FREE_LIMIT
+    return str(max(0, limit - get_user_usage(feature, context)))
 
 # ===== HISTORY + analytics =====
 def _push_history(context: ContextTypes.DEFAULT_TYPE, feature: str, size: int) -> None:
@@ -116,7 +125,7 @@ def _format_history(context: ContextTypes.DEFAULT_TYPE, limit: int = 10) -> str:
     hist: List[Dict[str, Any]] = context.user_data.get("history", [])
     if not hist: return "Пока нет записей об использовании."
     return "\n".join(f"• {i['ts']}: {i['feature']} (длина ввода: {i['size']})"
-                     for i in list(reversed(hist))[:limit])
+                       for i in list(reversed(hist))[:limit])
 
 def _record_ai_stat(application: Application, ok: bool) -> None:
     stats = application.bot_data.setdefault("ai_stats", [])
@@ -138,7 +147,6 @@ def _touch_seen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["last_username"] = (u.username or "")[:64]
         context.user_data["first_name"] = (u.first_name or "")[:128]
         context.user_data["last_name"] = (u.last_name or "")[:128]
-    # аналитика активности
     _track_active(context.application, update.effective_user.id)
     _ensure_first_seen(context)
 
@@ -207,7 +215,7 @@ def _count_new_users(app: Application, days: int) -> int:
 
 def _feature_usage_today(bd: dict) -> Dict[str, int]:
     fm = bd.get("feature_usage_today", {}).get(_today(), {})
-    return {"rewriter": int(fm.get("rewriter", 0)), "literature": int(fm.get("literature", 0))}
+    return {"rewriter": int(fm.get("rewriter", 0)), "literature": int(fm.get("literature", 0)), "file_rewrite": int(fm.get("file_rewrite", 0))}
 
 # ===== Gemini =====
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
@@ -219,16 +227,7 @@ async def call_gemini(prompt: str) -> str:
         f"https://generativelanguage.googleapis.com/v1/models/"
         f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     )
-
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}]
-            }
-        ]
-    }
-
+    payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
     try:
         from httpx import AsyncClient, HTTPStatusError
         async with AsyncClient(timeout=60.0) as client:
@@ -262,7 +261,8 @@ def _no_literature_found(txt: str) -> bool:
 # ===== Keyboards =====
 def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("✍️ AI-Рерайтер (Уникальность)", callback_data="rewriter")],
+        [InlineKeyboardButton("✍️ AI-Рерайтер текста", callback_data="rewriter")],
+        [InlineKeyboardButton("📄 AI-Рерайт файла (PDF/DOCX)", callback_data="file_rewriter")],
         [InlineKeyboardButton("📚 Генератор списка литературы", callback_data="literature")],
         [InlineKeyboardButton("📋 Консультант по ГОСТу", callback_data="gost")],
         [InlineKeyboardButton("👤 Личный кабинет", callback_data="cabinet")],
@@ -302,7 +302,7 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📣 Рассылка", callback_data="admin_broadcast"),
          InlineKeyboardButton("📤 Экспорт CSV", callback_data="admin_export")],
         [InlineKeyboardButton("🚫 Блокировка", callback_data="admin_blacklist"),
-         InlineKeyboardButton("👻 Теневой бан", callback_data="admin_shadow")],
+         InlineKeyboardButton("� Теневой бан", callback_data="admin_shadow")],
         [InlineKeyboardButton("🎚 Задать лимиты", callback_data="admin_setlimit"),
          InlineKeyboardButton("📈 Метрики", callback_data="admin_metrics")],
         [InlineKeyboardButton("⬅️ Назад в главное меню", callback_data="back_to_main_menu")],
@@ -367,7 +367,7 @@ def _ensure_first_seen(context: ContextTypes.DEFAULT_TYPE) -> None:
     if "first_seen" not in context.user_data:
         context.user_data["first_seen"] = _today()
 
-# ===== /start (+ рефералки) =====
+# ===== /start (+ рефералки) - ИСПРАВЛЕНО =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         args = context.args if hasattr(context, "args") else []
@@ -515,7 +515,7 @@ async def reset_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try: await context.bot.send_message(chat_id=target_id, text="🎉 Ваш дневной лимит сброшен администратором.")
     except Exception: pass
 
-# ===== add_subscription =====
+# ===== add_subscription - ИСПРАВЛЕНО =====
 async def add_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Только администратор.")
@@ -527,7 +527,7 @@ async def add_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except Exception:
         await update.message.reply_text("Используйте: /addsub <user_id> <days>")
         return
-
+    
     ud = context.application.user_data.get(target_id)
     if not ud:
         await update.message.reply_text("Пользователь не найден.")
@@ -546,10 +546,10 @@ async def add_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     new_exp_date = start_date + timedelta(days=days)
     new_exp_str = new_exp_date.strftime("%Y-%m-%d")
     ud["subscription_expires"] = new_exp_str
-
+    
     new_exp_human = new_exp_date.strftime('%d.%m.%Y')
     await update.message.reply_text(f"✅ Подписка для {target_id} продлена/установлена до {new_exp_human}")
-
+    
     try:
         await context.bot.send_message(
             chat_id=target_id,
@@ -646,7 +646,7 @@ async def admin_addsub_receive_days(update: Update, context: ContextTypes.DEFAUL
     ud = context.application.user_data.get(target_id)
     if not ud:
         await update.message.reply_text("Пользователь не найден.", reply_markup=admin_cancel_kb()); return ADMIN_MENU
-
+    
     start_date = datetime.now().date()
     current_exp_str = ud.get("subscription_expires")
     if current_exp_str:
@@ -656,7 +656,7 @@ async def admin_addsub_receive_days(update: Update, context: ContextTypes.DEFAUL
                 start_date = current_exp_date
         except (ValueError, TypeError):
             pass
-
+            
     exp = (start_date + timedelta(days=days)).strftime("%Y-%m-%d")
     ud["subscription_expires"]=exp
     await update.message.reply_text("✅ Подписка выдана.", reply_markup=admin_cancel_kb())
@@ -753,7 +753,7 @@ async def admin_tags_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text("Неверный ID.", reply_markup=admin_cancel_kb()); return ADMIN_TAGS_WAIT_ID
     context.user_data["tags_target"] = target
     await update.message.reply_text("Введите теги через запятую (для удаления перед тегом поставьте -):\n"
-                                    "пример: vip, блогер, -test", reply_markup=admin_cancel_kb())
+                                      "пример: vip, блогер, -test", reply_markup=admin_cancel_kb())
     return ADMIN_TAGS_WAIT_VALUE
 
 async def admin_tags_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -796,7 +796,7 @@ async def admin_broadcast_pick(update: Update, context: ContextTypes.DEFAULT_TYP
     segment = data.replace("_silent", "")
     context.user_data["b_segment"] = segment
     context.user_data["b_silent"] = is_silent
-
+    
     mode_text = " (тихая рассылка)" if is_silent else ""
     await update.callback_query.message.edit_text(f"Введите текст рассылки{mode_text}:", reply_markup=admin_cancel_kb())
     return ADMIN_BROADCAST_WAIT_TEXT
@@ -828,7 +828,7 @@ async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYP
         try:
             await context.bot.send_message(chat_id=uid, text=txt, disable_notification=is_silent)
             sent += 1
-            time.sleep(0.1)
+            time.sleep(0.1) 
         except Exception:
             continue
     await update.message.reply_text(f"Готово. Отправлено: {sent}", reply_markup=admin_cancel_kb())
@@ -864,7 +864,7 @@ async def admin_setlimit_id(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Неверный ID.", reply_markup=admin_cancel_kb()); return ADMIN_SETLIMIT_WAIT_ID
     context.user_data["limit_target"] = target
     await update.message.reply_text("Введите два числа через пробел — рерайтер и литература (сегодня):\nнапр. 2 1",
-                                    reply_markup=admin_cancel_kb())
+                                      reply_markup=admin_cancel_kb())
     return ADMIN_SETLIMIT_WAIT_VALUES
 
 async def admin_setlimit_values(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -946,7 +946,8 @@ def _metrics_text(app: Application) -> str:
         f"• Новых за 30 дней: <b>{new_30}</b>\n\n"
         f"• Использование сегодня:\n"
         f"  ├─ Рерайтер: <b>{feats.get('rewriter',0)}</b>\n"
-        f"  └─ Литература: <b>{feats.get('literature',0)}</b>"
+        f"  ├─ Литература: <b>{feats.get('literature',0)}</b>\n"
+        f"  └─ Рерайт файлов: <b>{feats.get('file_rewrite',0)}</b>"
     )
 
 async def admin_metrics_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -977,7 +978,7 @@ async def admin_metrics_export(update: Update, context: ContextTypes.DEFAULT_TYP
     feat = bd.get("feature_usage_today", {})
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["date","dau","rewriter_uses","literature_uses","new_users"])
+    w.writerow(["date","dau","rewriter_uses","literature_uses","file_rewrite_uses","new_users"])
     for i in range(30):
         d = datetime.now().date() - timedelta(days=i)
         key = d.strftime("%Y-%m-%d")
@@ -985,11 +986,12 @@ async def admin_metrics_export(update: Update, context: ContextTypes.DEFAULT_TYP
         f = feat.get(key, {})
         rew = int(f.get("rewriter", 0))
         lit = int(f.get("literature", 0))
+        fil = int(f.get("file_rewrite", 0))
         new_cnt = 0
         for _, ud in context.application.user_data.items():
             if ud.get("first_seen") == key:
                 new_cnt += 1
-        w.writerow([key, dau_cnt, rew, lit, new_cnt])
+        w.writerow([key, dau_cnt, rew, lit, fil, new_cnt])
     byte = io.BytesIO(buf.getvalue().encode("utf-8"))
     byte.name = "metrics_30d.csv"
     await update.callback_query.message.reply_document(InputFile(byte), caption="Метрики за 30 дней (CSV)")
@@ -1019,8 +1021,12 @@ async def cabinet_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     uid = update.effective_user.id
     used_rew = get_user_usage("rewriter", context)
     used_lit = get_user_usage("literature", context)
+    used_file = get_user_usage("file_rewrite", context)
+    
     left_rew = remaining_attempts("rewriter", context, uid)
     left_lit = remaining_attempts("literature", context, uid)
+    left_file = remaining_attempts("file_rewrite", context, uid)
+    
     tone = context.user_data.get("tone", "официальный")
     gost = context.user_data.get("gost", "универсальный")
 
@@ -1032,8 +1038,10 @@ async def cabinet_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         sub_text = "базовый доступ"
         total = FREE_LIMIT
 
-    pr1 = _progress_bar(used_rew if total else 0, total) if total else "∞"
-    pr2 = _progress_bar(used_lit if total else 0, total) if total else "∞"
+    pr1 = _progress_bar(used_rew, total) if total else "∞"
+    pr2 = _progress_bar(used_lit, total) if total else "∞"
+    pr3 = _progress_bar(used_file, FILE_REWRITE_LIMIT) if total else "∞"
+
 
     text = (
         "👤 <b>Личный кабинет</b>\n\n"
@@ -1041,6 +1049,7 @@ async def cabinet_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         f"<b>Доступ:</b> {sub_text}\n"
         f"<b>Сброс лимитов:</b> { _next_reset_str() }\n\n"
         f"✍️ Рерайтер: {pr1} (ост: {html.escape(left_rew)})\n"
+        f"📄 Рерайт файлов: {pr3} (ост: {html.escape(left_file)})\n"
         f"📚 Литература: {pr2} (ост: {html.escape(left_lit)})\n\n"
         f"🗣 Тон рерайта: <b>{html.escape(tone)}</b>\n"
         f"📏 ГОСТ: <b>{html.escape(gost)}</b>"
@@ -1091,7 +1100,7 @@ async def cabinet_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⬅️ Назад", callback_data="cabinet")],
-        [InlineKeyboardButton("Поделиться ссылкой", url=link)]
+        [InlineKeyboardButton("Поделиться ссылкой", url=f"https://t.me/share/url?url={link}&text=Привет!%20Нашел%20крутого%20AI-помощника%20для%20учебы")]
     ])
     await update.callback_query.message.edit_text(txt, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
     return CABINET_MENU
@@ -1107,11 +1116,11 @@ async def settings_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     data = update.callback_query.data
     if data == "set_tone":
         await update.callback_query.message.edit_text("Введите желаемый тон рерайта (напр.: официальный / научный / нейтральный):",
-                                                      reply_markup=admin_cancel_kb())
+                                                     reply_markup=admin_cancel_kb())
         return SETTINGS_TONE_WAIT
     if data == "set_gost":
         await update.callback_query.message.edit_text("Введите ГОСТ по умолчанию (напр.: РАНХиГС 2021 / универсальный):",
-                                                      reply_markup=admin_cancel_kb())
+                                                     reply_markup=admin_cancel_kb())
         return SETTINGS_GOST_WAIT
     return SETTINGS_MENU
 
@@ -1448,4 +1457,4 @@ def main() -> None:
     app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    main 

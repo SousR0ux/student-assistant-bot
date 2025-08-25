@@ -14,14 +14,14 @@ from telegram.helpers import escape_markdown
 from telegram.error import BadRequest
 
 # НОВЫЕ ИМПОРТЫ
-from file_rewriter import parse_document, rewrite_main_async, build_docx
+from file_rewriter import process_docx_for_rewrite, rewrite_highlighted_parts_async, build_final_docx
 from file_utils import read_telegram_file
 
 # ===== .env / .evn =====
 try:
     from dotenv import load_dotenv, find_dotenv
     load_dotenv(find_dotenv(filename=".env", raise_error_if_not_found=False))
-    if os.path.exists(".evn"):  # поддержка опечатки
+    if os.path.exists(".evn"):
         load_dotenv(".evn")
 except Exception:
     pass
@@ -31,7 +31,7 @@ BOT_TOKEN        = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
 ADMIN_CHAT_ID    = os.getenv("ADMIN_CHAT_ID")
 FREE_LIMIT       = int(os.getenv("FREE_LIMIT", "5"))
-FILE_REWRITE_LIMIT = int(os.getenv("FILE_REWRITE_LIMIT", "1"))
+FILE_REWRITE_LIMIT = int(os.getenv("FILE_REWRITE_LIMIT", "0")) # По умолчанию 0 бесплатных попыток
 RL_WINDOW_SEC    = int(os.getenv("RL_WINDOW_SEC", "10"))
 RL_MAX_HITS      = int(os.getenv("RL_MAX_HITS", "3"))
 CAPTCHA_ENABLED  = os.getenv("CAPTCHA_ENABLED", "1") == "1"
@@ -65,8 +65,9 @@ logger = logging.getLogger(__name__)
     ADMIN_SETLIMIT_WAIT_ID, ADMIN_SETLIMIT_WAIT_VALUES,
     ADMIN_BLACKLIST_WAIT_ID, ADMIN_SHADOW_WAIT_ID,
     ADMIN_METRICS_MENU,
-    FILE_REWRITE_WAIT_FILE
-) = range(26)
+    FILE_REWRITE_WAIT_FILE,
+    ADMIN_ADDSUB_FILE_WAIT_ID, ADMIN_ADDSUB_FILE_WAIT_DAYS
+) = range(28)
 
 # ===== HELPERS: dates/roles =====
 def _today() -> str: return datetime.now().strftime("%Y-%m-%d")
@@ -76,6 +77,14 @@ def is_admin(uid: int) -> bool: return ADMIN_USER_ID is not None and uid == ADMI
 
 def has_active_subscription(context: ContextTypes.DEFAULT_TYPE) -> bool:
     exp = context.user_data.get("subscription_expires")
+    if not exp: return False
+    try:
+        return datetime.strptime(exp, "%Y-%m-%d").date() >= datetime.now().date()
+    except Exception:
+        return False
+
+def has_file_rewrite_access(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    exp = context.user_data.get("file_subscription_expires")
     if not exp: return False
     try:
         return datetime.strptime(exp, "%Y-%m-%d").date() >= datetime.now().date()
@@ -108,10 +117,18 @@ def increment_usage(feature: str, context: ContextTypes.DEFAULT_TYPE) -> int:
     return d["count"]
 
 def remaining_attempts(feature: str, context: ContextTypes.DEFAULT_TYPE, uid: int) -> str:
-    if is_admin(uid) or has_active_subscription(context):
+    if is_admin(uid):
         return "∞ (Безлимит)"
     
-    limit = FILE_REWRITE_LIMIT if feature == "file_rewrite" else FREE_LIMIT
+    if feature == "file_rewrite":
+        if has_file_rewrite_access(context):
+            return "∞ (Подписка)"
+        limit = FILE_REWRITE_LIMIT
+    else:
+        if has_active_subscription(context):
+            return "∞ (Подписка)"
+        limit = FREE_LIMIT
+        
     return str(max(0, limit - get_user_usage(feature, context)))
 
 # ===== HISTORY + analytics =====
@@ -262,7 +279,7 @@ def _no_literature_found(txt: str) -> bool:
 def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("✍️ AI-Рерайтер текста", callback_data="rewriter")],
-        [InlineKeyboardButton("📄 AI-Рерайт файла (PDF/DOCX)", callback_data="file_rewriter")],
+        [InlineKeyboardButton("📄 AI-Рерайт файла (DOCX)", callback_data="file_rewriter")],
         [InlineKeyboardButton("📚 Генератор списка литературы", callback_data="literature")],
         [InlineKeyboardButton("📋 Консультант по ГОСТу", callback_data="gost")],
         [InlineKeyboardButton("👤 Личный кабинет", callback_data="cabinet")],
@@ -295,8 +312,9 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔁 Сбросить лимиты", callback_data="admin_reset"),
          InlineKeyboardButton("📊 Статус пользователя", callback_data="admin_status")],
-        [InlineKeyboardButton("➕ Добавить подписку", callback_data="admin_addsub"),
-         InlineKeyboardButton("❌ Отменить подписку", callback_data="admin_delsub")],
+        [InlineKeyboardButton("➕ Подписка (общая)", callback_data="admin_addsub"),
+         InlineKeyboardButton("📄 Подписка на файлы", callback_data="admin_addsub_file")],
+        [InlineKeyboardButton("❌ Отменить подписку", callback_data="admin_delsub")],
         [InlineKeyboardButton("🔎 Поиск пользователя", callback_data="admin_search"),
          InlineKeyboardButton("🏷 Теги", callback_data="admin_tags")],
         [InlineKeyboardButton("📣 Рассылка", callback_data="admin_broadcast"),
@@ -647,6 +665,63 @@ async def admin_addsub_receive_days(update: Update, context: ContextTypes.DEFAUL
     if not ud:
         await update.message.reply_text("Пользователь не найден.", reply_markup=admin_cancel_kb()); return ADMIN_MENU
     
+# ===== НОВЫЙ БЛОК: УПРАВЛЕНИЕ ПОДПИСКОЙ НА ФАЙЛЫ (через админ-панель) =====
+async def admin_addsub_file_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.callback_query.answer()
+    await update.callback_query.message.edit_text("📄 <b>Подписка на рерайт файлов</b>\n\nВведите <b>ID пользователя</b>:", parse_mode="HTML",
+                                                 reply_markup=admin_cancel_kb())
+    return ADMIN_ADDSUB_FILE_WAIT_ID
+
+async def admin_addsub_file_receive_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        target_id = int((update.message.text or "").strip())
+    except Exception:
+        await update.message.reply_text("Неверный ID. Введите число.", reply_markup=admin_cancel_kb())
+        return ADMIN_ADDSUB_FILE_WAIT_ID
+    context.user_data["admin_addsub_target"] = target_id
+    await update.message.reply_html(f"ID <code>{target_id}</code> принят. Введите <b>количество дней</b> подписки на рерайт файлов:", reply_markup=admin_cancel_kb())
+    return ADMIN_ADDSUB_FILE_WAIT_DAYS
+
+async def admin_addsub_file_receive_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        days = int((update.message.text or "").strip())
+        assert days > 0
+    except Exception:
+        await update.message.reply_text("Неверное число. Введите положительное целое.", reply_markup=admin_cancel_kb())
+        return ADMIN_ADDSUB_FILE_WAIT_DAYS
+    
+    target_id = context.user_data.get("admin_addsub_target")
+    if target_id is None:
+        await update.message.reply_text("Сессия сброшена. Повторите.", reply_markup=admin_cancel_kb())
+        return ADMIN_MENU
+        
+    ud = context.application.user_data.get(target_id)
+    if not ud:
+        await update.message.reply_text("Пользователь не найден.", reply_markup=admin_cancel_kb())
+        return ADMIN_MENU
+
+    start_date = datetime.now().date()
+    current_exp_str = ud.get("file_subscription_expires")
+    if current_exp_str:
+        try:
+            current_exp_date = datetime.strptime(current_exp_str, "%Y-%m-%d").date()
+            if current_exp_date > start_date:
+                start_date = current_exp_date
+        except (ValueError, TypeError):
+            pass
+            
+    exp = (start_date + timedelta(days=days)).strftime("%Y-%m-%d")
+    ud["file_subscription_expires"] = exp
+    await update.message.reply_text(f"✅ Подписка на рерайт файлов выдана до {datetime.strptime(exp,'%Y-%m-%d').strftime('%d.%m.%Y')}.", reply_markup=admin_cancel_kb())
+    
+    try:
+        await context.bot.send_message(chat_id=target_id, text=f"🎉 Вам активирован доступ к рерайту файлов на {days} дней.")
+    except Exception:
+        pass
+        
+    context.user_data.pop("admin_addsub_target", None)
+    return ADMIN_MENU
+
     start_date = datetime.now().date()
     current_exp_str = ud.get("subscription_expires")
     if current_exp_str:
@@ -1335,27 +1410,23 @@ async def file_rewriter_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     uid = update.effective_user.id
     await q.answer()
 
-    if _is_blacklisted(context.application, uid):
-        await q.message.edit_text("🚫 Доступ ограничен.")
-        return MAIN_MENU
-    if _is_shadowbanned(context.application, uid):
-        await q.message.edit_text("Сервис перегружен.")
+    if _is_blacklisted(context.application, uid) or _is_shadowbanned(context.application, uid):
+        await q.message.edit_text("🚫 Доступ к этой функции ограничен.")
         return MAIN_MENU
 
-    if not is_admin(uid) and not has_active_subscription(context):
-        if get_user_usage("file_rewrite", context) >= FILE_REWRITE_LIMIT:
-            await q.edit_message_text(
-                (f"🚫 <b>Дневной лимит на рерайт файлов ({FILE_REWRITE_LIMIT}) исчерпан</b>\n\n"
-                 "Хотите продолжить без ожидания? Напишите: <a href='https://t.me/V_L_A_D_IS_L_A_V'>@V_L_A_D_IS_L_A_V</a>\n"
-                 f"Ваш ID: <code>{uid}</code>"), parse_mode="HTML", reply_markup=contact_kb())
-            return MAIN_MENU
+    if not is_admin(uid) and not has_file_rewrite_access(context):
+        await q.edit_message_text(
+            ("📄 <b>Рерайт файлов</b> — это платный инструмент.\n\n"
+             "Для покупки доступа, пожалуйста, напишите администратору: <a href='https://t.me/V_L_A_D_IS_L_A_V'>@V_L_A_D_IS_L_A_V</a>\n"
+             f"Ваш ID для связи: <code>{uid}</code>"), parse_mode="HTML", reply_markup=contact_kb())
+        return MAIN_MENU
 
-    left = remaining_attempts("file_rewrite", context, uid)
     await q.edit_message_text(
-        ("📄 *AI-Рерайт файла*\n\n"
-         "Отправьте мне документ в формате **PDF, DOCX или TXT**.\n\n"
-         "Я автоматически найду основную часть, перепишу её для повышения уникальности и соберу новый DOCX-файл, сохранив титульник, содержание и список литературы.\n\n"
-         f"Доступно сегодня: *{left}*"),
+        ("📄 *AI-Рерайт файла (DOCX)*\n\n"
+         "1. Откройте ваш `.docx` документ.\n"
+         "2. Выделите **жёлтым цветом** текст, который нужно переписать.\n"
+         "3. Сохраните и отправьте мне этот файл.\n\n"
+         "Я перепишу только выделенные фрагменты, сохранив остальной текст и оформление."),
         parse_mode="Markdown", reply_markup=back_menu_kb())
     return FILE_REWRITE_WAIT_FILE
 
@@ -1363,35 +1434,39 @@ async def process_document_rewrite(update: Update, context: ContextTypes.DEFAULT
     _touch_seen(update, context)
     uid = update.effective_user.id
 
-    if not is_admin(uid) and not has_active_subscription(context):
-        if get_user_usage("file_rewrite", context) >= FILE_REWRITE_LIMIT:
-            await update.message.reply_html(
-                (f"🚫 <b>Дневной лимит на рерайт файлов ({FILE_REWRITE_LIMIT}) исчерпан</b>\n\n"
-                 "Хотите продолжить без ожидания? Напишите: <a href='https://t.me/V_L_A_D_IS_L_A_V'>@V_L_A_D_IS_L_A_V</a>\n"
-                 f"Ваш ID: <code>{uid}</code>"), reply_markup=contact_kb())
-            return FILE_REWRITE_WAIT_FILE
+    if not is_admin(uid) and not has_file_rewrite_access(context):
+        await update.message.reply_html(
+            ("🚫 У вас нет активной подписки на рерайт файлов. Для покупки доступа напишите администратору."),
+            reply_markup=contact_kb())
+        return FILE_REWRITE_WAIT_FILE
 
     try:
-        processing_msg = await update.message.reply_text("⏳ Получил файл. Начинаю анализ структуры... Это может занять несколько минут.")
         file_bytes, filename = await read_telegram_file(update)
         
-        parsed = parse_document(file_bytes, filename)
-        
-        await processing_msg.edit_text("Структура определена. Отправляю основную часть на рерайт в AI...")
+        if not filename.lower().endswith(".docx"):
+            await update.message.reply_text("❌ Пожалуйста, отправьте файл в формате .docx")
+            return FILE_REWRITE_WAIT_FILE
 
-        new_main_text = await rewrite_main_async(
-            parsed,
+        processing_msg = await update.message.reply_text("⏳ Получил DOCX. Ищу выделенный текст...")
+        
+        original_doc, highlighted_parts = process_docx_for_rewrite(file_bytes)
+        
+        if not highlighted_parts:
+            await processing_msg.edit_text("⚠️ В вашем файле не найден текст, выделенный жёлтым цветом. Пожалуйста, выделите нужные фрагменты и отправьте файл снова.")
+            return FILE_REWRITE_WAIT_FILE
+
+        await processing_msg.edit_text(f"Найдено {len(highlighted_parts)} фрагмент(ов). Отправляю на рерайт в AI...")
+
+        rewritten_parts = await rewrite_highlighted_parts_async(
+            highlighted_parts,
             rewrite_fn=call_gemini,
             tone=context.user_data.get("tone", "официальный"),
             target_uniqueness="85-95%"
         )
 
-        await processing_msg.edit_text("✅ Рерайт готов. Собираю итоговый DOCX-документ...")
+        await processing_msg.edit_text("✅ Рерайт готов. Собираю итоговый документ...")
         
-        docx_bytes = build_docx(parsed, new_main_text)
-        
-        if not is_admin(uid) and not has_active_subscription(context):
-            increment_usage("file_rewrite", context)
+        docx_bytes = build_final_docx(original_doc, rewritten_parts)
         
         _push_history(context, "file_rewrite", len(file_bytes))
 
@@ -1399,16 +1474,15 @@ async def process_document_rewrite(update: Update, context: ContextTypes.DEFAULT
         bio = io.BytesIO(docx_bytes)
         bio.name = new_filename
         
-        left = remaining_attempts("file_rewrite", context, uid)
         await processing_msg.delete()
         await update.message.reply_document(
             InputFile(bio), 
-            caption=f"Готово! Основная часть вашего документа переписана.\n\nОсталось попыток на сегодня: {left}"
+            caption="Готово! Выделенные части вашего документа переписаны."
         )
 
     except Exception as e:
         logger.error("Ошибка при обработке файла: %s", e, exc_info=True)
-        await update.message.reply_text(f"❌ Произошла ошибка при обработке файла: {e}\n\nПопробуйте еще раз или свяжитесь с администратором.")
+        await update.message.reply_text(f"❌ Произошла ошибка: {e}\n\nПопробуйте еще раз или свяжитесь с администратором.")
 
     return FILE_REWRITE_WAIT_FILE
 
@@ -1496,6 +1570,7 @@ def main() -> None:
             ADMIN_MENU: [
                 CallbackQueryHandler(admin_reset_start, pattern="^admin_reset$"),
                 CallbackQueryHandler(admin_addsub_start, pattern="^admin_addsub$"),
+                CallbackQueryHandler(admin_addsub_file_start, pattern="^admin_addsub_file$"),
                 CallbackQueryHandler(admin_delsub_start, pattern="^admin_delsub$"),
                 CallbackQueryHandler(admin_status_start, pattern="^admin_status$"),
                 CallbackQueryHandler(admin_search_start, pattern="^admin_search$"),
@@ -1531,6 +1606,8 @@ def main() -> None:
                 CallbackQueryHandler(admin_metrics_export, pattern="^admin_metrics_export$"),
                 CallbackQueryHandler(admin_panel_open, pattern="^admin_panel$"),
             ],
+            ADMIN_ADDSUB_FILE_WAIT_ID: [ MessageHandler(filters.TEXT & ~filters.COMMAND, admin_addsub_file_receive_id) ],
+            ADMIN_ADDSUB_FILE_WAIT_DAYS: [ MessageHandler(filters.TEXT & ~filters.COMMAND, admin_addsub_file_receive_days) ],
             FILE_REWRITE_WAIT_FILE: [
                 MessageHandler(filters.Document.ALL, process_document_rewrite),
                 CallbackQueryHandler(start, pattern="^back_to_main_menu$"),

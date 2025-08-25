@@ -1463,6 +1463,12 @@ def main() -> None:
                 CallbackQueryHandler(admin_panel_open, pattern="^admin_panel$"),
                 CallbackQueryHandler(file_rewriter_start, pattern="^file_rewriter$"),
                 CallbackQueryHandler(start, pattern="^back_to_main_menu$"),
+                CallbackQueryHandler(file_rewriter_start, pattern="^file_rewriter$"),
+                CallbackQueryHandler(literature_start, pattern="^literature$"),
+                CallbackQueryHandler(gost_menu, pattern="^gost$"),
+                CallbackQueryHandler(cabinet_open, pattern="^cabinet$"),
+                CallbackQueryHandler(admin_panel_open, pattern="^admin_panel$"),
+                CallbackQueryHandler(start, pattern="^back_to_main_menu$"),
             ],
             REWRITER_TEXT_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, rewriter_process_text),

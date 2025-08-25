@@ -1,75 +1,91 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Tuple, Callable, Awaitable, TYPE_CHECKING, Any, TypeAlias
 import io
+from dataclasses import dataclass
+from typing import List, Tuple, Callable, Awaitable, TYPE_CHECKING, Any
 
-# ---- optional runtime deps ----
+# ----- Безопасные типы для подсказок (не ломают Pylance) -----
+if TYPE_CHECKING:
+    from docx.document import Document as DocxDocument
+    from docx.text.run import Run
+else:
+    DocxDocument = Any
+    Run = Any
+
+# ----- python-docx (может отсутствовать в окружении) -----
 try:
     import docx  # type: ignore
     from docx.enum.text import WD_COLOR_INDEX  # type: ignore
-except Exception:
-    docx = None  # type: ignore
+except ImportError:  # библиотека не установлена
+    docx = None            # type: ignore
     WD_COLOR_INDEX = None  # type: ignore
 
-# ---- types for static checking (no runtime import errors) ----
-if TYPE_CHECKING:
-    from docx.document import Document as DocxDocument  # type: ignore
-    from docx.text.run import Run  # type: ignore
-else:
-    DocxDocument: TypeAlias = Any
-    Run: TypeAlias = Any
 
+# ===================== DATA CLASSES =====================
 
 @dataclass
 class HighlightedPart:
+    """
+    Один логический выделенный фрагмент в документе.
+    run_indices: список кортежей (paragraph_index, run_index) для всех run'ов,
+                 входящих в этот фрагмент.
+    """
     original_text: str
     part_index: int
-    run_indices: List[Tuple[int, int]]  # (paragraph_index, run_index)
+    run_indices: List[Tuple[int, int]]
 
 
 @dataclass
 class RewrittenPart:
+    """Результат рерайта конкретного HighlightedPart."""
     rewritten_text: str
     original_part: HighlightedPart
 
 
-def process_docx_for_rewrite(file_bytes: bytes) -> tuple[DocxDocument, List[HighlightedPart]]:
-    """Собираем подряд идущие выделенные жёлтым фрагменты в «части»."""
-    if docx is None:
-        raise RuntimeError("Библиотека python-docx не установлена. Выполните: pip install python-docx")
+# ===================== ВНУТРЕННИЕ ХЕЛПЕРЫ =====================
 
-    doc = docx.Document(io.BytesIO(file_bytes))
-    parts: List[HighlightedPart] = []
+def _require_docx() -> None:
+    if docx is None:  # pragma: no cover
+        raise RuntimeError(
+            "Библиотека python-docx не установлена. Выполните: pip install python-docx"
+        )
 
-    cur_txt: str = ""
-    cur_runs: List[Tuple[int, int]] = []
-    part_id = 0
-    YELLOW = getattr(WD_COLOR_INDEX, "YELLOW", 7)
 
-    for p_i, p in enumerate(doc.paragraphs):
-        for r_i, run in enumerate(p.runs):
-            if getattr(run.font, "highlight_color", None) == YELLOW:
-                cur_txt += run.text
-                cur_runs.append((p_i, r_i))
-            else:
-                if cur_txt:
-                    parts.append(HighlightedPart(cur_txt, part_id, cur_runs))
-                    part_id += 1
-                    cur_txt, cur_runs = "", []
+def _is_yellow_highlight(run: Run) -> bool:
+    """
+    Проверка, что run выделен жёлтой заливкой.
+    Работает и с Enum, и с числом, и со строковым представлением.
+    """
+    try:
+        h = run.font.highlight_color
+        if h is None:
+            return False
 
-    if cur_txt:
-        parts.append(HighlightedPart(cur_txt, part_id, cur_runs))
+        # Если есть Enum WD_COLOR_INDEX
+        if WD_COLOR_INDEX is not None:
+            try:
+                return h == WD_COLOR_INDEX.YELLOW  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
-    return doc, parts
+        # Иногда приходит int/str/enum-like
+        if hasattr(h, "value"):
+            return int(h.value) == 7
+        if isinstance(h, int):
+            return h == 7
+        return str(h).upper().endswith("YELLOW")
+    except Exception:
+        return False
 
 
 def _chunk_text(text: str, max_chars: int = 8000) -> List[str]:
-    text = text.strip()
+    text = (text or "").strip()
+    if not text:
+        return []
     if len(text) <= max_chars:
         return [text]
-    return [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+    return [text[i : i + max_chars] for i in range(0, len(text), max_chars)]
 
 
 def _build_prompt(chunk: str, tone: str, target_uniqueness: str) -> str:
@@ -78,105 +94,168 @@ def _build_prompt(chunk: str, tone: str, target_uniqueness: str) -> str:
         "Ты — академический редактор. Перепиши фрагмент так, чтобы:\n"
         f"- стиль: {tone};\n"
         "- сохранялась исходная мысль и структура;\n"
-        "- не добавлять вступления/выводы от себя;\n"
+        "- не добавлять вступления/выводы от себя и лишние пояснения;\n"
         f"{uniq}\n"
-        "ТЕКСТ:\n\"\"\"\n" + chunk + "\n\"\"\"\n"
-        "ВЫВОД: (только перефразированный текст)"
+        "ТЕКСТ ДЛЯ РЕРАЙТА:\n"
+        f"\"\"\"\n{chunk}\n\"\"\"\n"
+        "ВЫВОД: только перефразированный текст, без комментариев."
     )
+
+
+def _replace_text_preserving_runs(doc: DocxDocument,
+                                  indices: List[Tuple[int, int]],
+                                  new_text: str) -> None:
+    """
+    Раскладывает new_text по тем же run'ам, что были в исходнике,
+    не меняя их форматирования. У всех run'ов снимается подсветка.
+    """
+    if not indices:
+        return
+
+    runs: List[Run] = [doc.paragraphs[p].runs[r] for p, r in indices]
+
+    # Снять подсветку
+    for rn in runs:
+        try:
+            rn.font.highlight_color = None
+        except Exception:
+            pass
+
+    # Длины исходных run'ов — для пропорционального распределения
+    orig_lens = [len(getattr(rn, "text", "") or "") for rn in runs]
+    total = sum(orig_lens)
+
+    # Если все были пустыми — кладём всё в первый run
+    if total == 0:
+        runs[0].text = new_text
+        for rn in runs[1:]:
+            rn.text = ""
+        return
+
+    tgt_len = len(new_text)
+    # Пропорциональная раздача символов
+    alloc: List[int] = []
+    acc = 0
+    for i, L in enumerate(orig_lens):
+        if i == len(orig_lens) - 1:
+            n = tgt_len - acc
+        else:
+            n = round(tgt_len * (L / total))
+            n = max(0, min(n, tgt_len - acc))
+        alloc.append(n)
+        acc += n
+
+    pos = 0
+    for rn, n in zip(runs, alloc):
+        rn.text = new_text[pos : pos + n]
+        pos += n
+    if pos < tgt_len:  # хвост в последний run
+        runs[-1].text += new_text[pos:]
+
+
+# ===================== ПУБЛИЧНЫЕ ФУНКЦИИ =====================
+
+def process_docx_for_rewrite(file_bytes: bytes) -> Tuple[DocxDocument, List[HighlightedPart]]:
+    """
+    Читает DOCX, собирает непрерывные (по run'ам) фрагменты с жёлтой заливкой.
+    Возвращает открытый документ и список частей для рерайта.
+    """
+    _require_docx()
+    doc: DocxDocument = docx.Document(io.BytesIO(file_bytes))  # type: ignore
+
+    parts: List[HighlightedPart] = []
+    cur_text: str = ""
+    cur_runs: List[Tuple[int, int]] = []
+    counter = 0
+
+    for p_idx, p in enumerate(doc.paragraphs):
+        for r_idx, run in enumerate(p.runs):
+            if _is_yellow_highlight(run):
+                cur_text += run.text
+                cur_runs.append((p_idx, r_idx))
+            else:
+                if cur_runs:
+                    parts.append(
+                        HighlightedPart(
+                            original_text=cur_text,
+                            part_index=counter,
+                            run_indices=cur_runs[:],
+                        )
+                    )
+                    counter += 1
+                    cur_text = ""
+                    cur_runs = []
+
+        # Разрыв абзаца — тоже конец непрерывного фрагмента
+        if cur_runs:
+            parts.append(
+                HighlightedPart(
+                    original_text=cur_text,
+                    part_index=counter,
+                    run_indices=cur_runs[:],
+                )
+            )
+            counter += 1
+            cur_text = ""
+            cur_runs = []
+
+    # На всякий случай, если закончили на подсветке
+    if cur_runs:
+        parts.append(
+            HighlightedPart(
+                original_text=cur_text,
+                part_index=counter,
+                run_indices=cur_runs[:],
+            )
+        )
+
+    return doc, parts
 
 
 async def rewrite_highlighted_parts_async(
     parts: List[HighlightedPart],
     rewrite_fn: Callable[[str], Awaitable[str]],
-    tone: str,
-    target_uniqueness: str
+    tone: str = "официальный",
+    target_uniqueness: str = ""
 ) -> List[RewrittenPart]:
-    out: List[RewrittenPart] = []
+    """
+    Асинхронно переписывает каждый выделенный фрагмент через ваш колбэк rewrite_fn.
+    Колбэк принимает СФОРМИРОВАННЫЙ prompt и возвращает текст ответа ИИ.
+    """
+    results: List[RewrittenPart] = []
+
     for part in parts:
-        if not part.original_text.strip():
+        src = (part.original_text or "").strip()
+        if not src:
             continue
-        acc: List[str] = []
-        for chunk in _chunk_text(part.original_text):
+
+        chunks = _chunk_text(src)
+        rewritten_acc: List[str] = []
+
+        for chunk in chunks:
             prompt = _build_prompt(chunk, tone, target_uniqueness)
-            rewritten = await rewrite_fn(prompt)
-            acc.append(rewritten.strip().strip("`"))
-        out.append(RewrittenPart(" ".join(acc).strip(), part))
-    return out
+            ai_out = await rewrite_fn(prompt)
+            rewritten_acc.append((ai_out or "").strip().strip("`"))
+
+        final_text = " ".join(x for x in rewritten_acc if x).strip()
+        results.append(RewrittenPart(rewritten_text=final_text, original_part=part))
+
+    return results
 
 
-def _is_bold(run: Run) -> bool:
-    """True, если на run явно включено жирное начертание."""
-    b1 = getattr(run, "bold", None)
-    b2 = getattr(getattr(run, "font", None), "bold", None)
-    return bool(b1 is True or b2 is True)
-
-
-def _pick_base_run(doc: DocxDocument, indices: List[Tuple[int, int]]) -> Run:
+def build_final_docx(original_doc: DocxDocument,
+                     rewritten_parts: List[RewrittenPart]) -> bytes:
     """
-    Выбираем run, чей стиль берём за «базовый».
-    Предпочитаем первый НЕ жирный; если все жирные — берём самый первый.
+    Вставляет переписанные тексты в исходный документ,
+    сохраняя форматирование (абзацы, стили run'ов, отступы).
+    Снимается только подсветка.
     """
-    p0, r0 = indices[0]
-    first: Run = doc.paragraphs[p0].runs[r0]  # type: ignore[assignment]
-    for p_i, r_i in indices:
-        candidate: Run = doc.paragraphs[p_i].runs[r_i]  # type: ignore[assignment]
-        if not _is_bold(candidate):
-            return candidate
-    return first
-
-
-def _apply_style_from_to(src: Run, dst: Run) -> None:
-    """Копируем ключевые атрибуты (в т.ч. выключаем подсветку)."""
-    try:
-        dst.bold = getattr(src, "bold", None)
-        dst.italic = getattr(src, "italic", None)
-        dst.underline = getattr(src, "underline", None)
-        dst.style = getattr(src, "style", None)
-
-        sfont = getattr(src, "font", None)
-        dfont = getattr(dst, "font", None)
-        if sfont and dfont:
-            if getattr(sfont, "name", None):
-                dfont.name = sfont.name
-            if getattr(sfont, "size", None):
-                dfont.size = sfont.size
-            dfont.highlight_color = None
-
-        if dst.bold is None and _is_bold(dst):
-            dst.bold = False
-    except Exception:
-        pass
-
-
-def build_final_docx(original_doc: DocxDocument, rewritten_parts: List[RewrittenPart]) -> bytes:
-    """
-    Вставляем переписанные тексты в первый run каждой выделенной группы,
-    копируя «нормальный» стиль и снимая подсветку. Остальные run'ы очищаем.
-    """
-    parts_map = {p.original_part.part_index: p for p in rewritten_parts}
-
-    for part in parts_map.values():
-        run_idxs = part.original_part.run_indices
-        if not run_idxs:
-            continue
-
-        base_run = _pick_base_run(original_doc, run_idxs)
-
-        tgt_p, tgt_r = run_idxs[0]
-        target_run: Run = original_doc.paragraphs[tgt_p].runs[tgt_r]  # type: ignore[assignment]
-
-        for p_i, r_i in run_idxs:
-            rr: Run = original_doc.paragraphs[p_i].runs[r_i]  # type: ignore[assignment]
-            try:
-                rr.font.highlight_color = None
-            except Exception:
-                pass
-
-        _apply_style_from_to(base_run, target_run)
-        target_run.text = part.rewritten_text
-
-        for p_i, r_i in run_idxs[1:]:
-            original_doc.paragraphs[p_i].runs[r_i].text = ""
+    for part in rewritten_parts:
+        _replace_text_preserving_runs(
+            original_doc,
+            part.original_part.run_indices,
+            part.rewritten_text
+        )
 
     bio = io.BytesIO()
     original_doc.save(bio)

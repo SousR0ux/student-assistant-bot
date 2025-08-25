@@ -31,7 +31,7 @@ BOT_TOKEN        = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
 ADMIN_CHAT_ID    = os.getenv("ADMIN_CHAT_ID")
 FREE_LIMIT       = int(os.getenv("FREE_LIMIT", "5"))
-FILE_REWRITE_LIMIT = int(os.getenv("FILE_REWRITE_LIMIT", "1")) # 1 бесплатный рерайт файла в день
+FILE_REWRITE_LIMIT = int(os.getenv("FILE_REWRITE_LIMIT", "1"))
 RL_WINDOW_SEC    = int(os.getenv("RL_WINDOW_SEC", "10"))
 RL_MAX_HITS      = int(os.getenv("RL_MAX_HITS", "3"))
 CAPTCHA_ENABLED  = os.getenv("CAPTCHA_ENABLED", "1") == "1"
@@ -302,7 +302,7 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📣 Рассылка", callback_data="admin_broadcast"),
          InlineKeyboardButton("📤 Экспорт CSV", callback_data="admin_export")],
         [InlineKeyboardButton("🚫 Блокировка", callback_data="admin_blacklist"),
-         InlineKeyboardButton("� Теневой бан", callback_data="admin_shadow")],
+         InlineKeyboardButton("👻 Теневой бан", callback_data="admin_shadow")],
         [InlineKeyboardButton("🎚 Задать лимиты", callback_data="admin_setlimit"),
          InlineKeyboardButton("📈 Метрики", callback_data="admin_metrics")],
         [InlineKeyboardButton("⬅️ Назад в главное меню", callback_data="back_to_main_menu")],
@@ -328,7 +328,7 @@ def admin_metrics_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")],
     ])
 
-# ===== Utils (Markdown, не V2) =====
+# ===== Utils =====
 TG_MD_LIMIT = 3800
 def _chunk_md(text: str, limit: int = TG_MD_LIMIT) -> List[str]:
     chunks, buf = [], ""
@@ -1167,7 +1167,7 @@ async def gost_show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     elif info_type == "gost_references":
         text = (
-            "**📚 Оформление списка литературы**\n\n"
+            "**� Оформление списка литературы**\n\n"
             "Список составляется в алфавитном порядке по фамилии автора. Сначала идут русскоязычные источники, затем иностранные.\n\n"
             "**Пример (книга):**\n"
             "`Иванов, И. И. Название книги / И. И. Иванов. – Москва : Издательство, 2023. – 250 с.`\n\n"
@@ -1234,6 +1234,92 @@ async def literature_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                                f"Доступно сегодня: *{left}*"),
                               parse_mode="Markdown", reply_markup=back_menu_kb())
     return LITERATURE_TOPIC_INPUT
+
+# ===== НОВЫЙ БЛОК: РЕРАЙТ ФАЙЛОВ =====
+async def file_rewriter_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    uid = update.effective_user.id
+    await q.answer()
+
+    if _is_blacklisted(context.application, uid):
+        await q.message.edit_text("🚫 Доступ ограничен.")
+        return MAIN_MENU
+    if _is_shadowbanned(context.application, uid):
+        await q.message.edit_text("Сервис перегружен.")
+        return MAIN_MENU
+
+    # Используем отдельный лимит для рерайта файлов
+    if not is_admin(uid) and not has_active_subscription(context):
+        if get_user_usage("file_rewrite", context) >= FILE_REWRITE_LIMIT:
+            await q.edit_message_text(
+                (f"🚫 <b>Дневной лимит на рерайт файлов ({FILE_REWRITE_LIMIT}) исчерпан</b>\n\n"
+                 "Хотите продолжить без ожидания? Напишите: <a href='https://t.me/V_L_A_D_IS_L_A_V'>@V_L_A_D_IS_L_A_V</a>\n"
+                 f"Ваш ID: <code>{uid}</code>"), parse_mode="HTML", reply_markup=contact_kb())
+            return MAIN_MENU
+
+    left = remaining_attempts("file_rewrite", context, uid)
+    await q.edit_message_text(
+        ("📄 *AI-Рерайт файла*\n\n"
+         "Отправьте мне документ в формате **PDF, DOCX или TXT**.\n\n"
+         "Я автоматически найду основную часть, перепишу её для повышения уникальности и соберу новый DOCX-файл, сохранив титульник, содержание и список литературы.\n\n"
+         f"Доступно сегодня: *{left}*"),
+        parse_mode="Markdown", reply_markup=back_menu_kb())
+    return FILE_REWRITE_WAIT_FILE
+
+async def process_document_rewrite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _touch_seen(update, context)
+    uid = update.effective_user.id
+
+    # Повторная проверка лимитов
+    if not is_admin(uid) and not has_active_subscription(context):
+        if get_user_usage("file_rewrite", context) >= FILE_REWRITE_LIMIT:
+            await update.message.reply_html(
+                (f"🚫 <b>Дневной лимит на рерайт файлов ({FILE_REWRITE_LIMIT}) исчерпан</b>\n\n"
+                 "Хотите продолжить без ожидания? Напишите: <a href='https://t.me/V_L_A_D_IS_L_A_V'>@V_L_A_D_IS_L_A_V</a>\n"
+                 f"Ваш ID: <code>{uid}</code>"), reply_markup=contact_kb())
+            return FILE_REWRITE_WAIT_FILE
+
+    try:
+        processing_msg = await update.message.reply_text("⏳ Получил файл. Начинаю анализ структуры... Это может занять несколько минут.")
+        file_bytes, filename = await read_telegram_file(update)
+        
+        parsed = parse_document(file_bytes, filename)
+        
+        await processing_msg.edit_text("Структура определена. Отправляю основную часть на рерайт в AI...")
+
+        new_main_text = await rewrite_main_async(
+            parsed,
+            rewrite_fn=call_gemini,
+            tone=context.user_data.get("tone", "официальный"),
+            target_uniqueness="85-95%"
+        )
+
+        await processing_msg.edit_text("✅ Рерайт готов. Собираю итоговый DOCX-документ...")
+        
+        docx_bytes = build_docx(parsed, new_main_text)
+        
+        # Списываем попытку только при полном успехе
+        if not is_admin(uid) and not has_active_subscription(context):
+            increment_usage("file_rewrite", context)
+        
+        _push_history(context, "file_rewrite", len(file_bytes))
+
+        new_filename = f"rewritten_{os.path.splitext(filename)[0]}.docx"
+        bio = io.BytesIO(docx_bytes)
+        bio.name = new_filename
+        
+        left = remaining_attempts("file_rewrite", context, uid)
+        await processing_msg.delete()
+        await update.message.reply_document(
+            InputFile(bio), 
+            caption=f"Готово! Основная часть вашего документа переписана.\n\nОсталось попыток на сегодня: {left}"
+        )
+
+    except Exception as e:
+        logger.error("Ошибка при обработке файла: %s", e, exc_info=True)
+        await update.message.reply_text(f"❌ Произошла ошибка при обработке файла: {e}\n\nПопробуйте еще раз или свяжитесь с администратором.")
+
+    return FILE_REWRITE_WAIT_FILE
 
 async def rewriter_process_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _touch_seen(update, context)
@@ -1375,6 +1461,7 @@ def main() -> None:
                 CallbackQueryHandler(gost_menu, pattern="^gost$"),
                 CallbackQueryHandler(cabinet_open, pattern="^cabinet$"),
                 CallbackQueryHandler(admin_panel_open, pattern="^admin_panel$"),
+                CallbackQueryHandler(file_rewriter_start, pattern="^file_rewriter$"),
                 CallbackQueryHandler(start, pattern="^back_to_main_menu$"),
             ],
             REWRITER_TEXT_INPUT: [
@@ -1447,6 +1534,10 @@ def main() -> None:
                 CallbackQueryHandler(admin_metrics_export, pattern="^admin_metrics_export$"),
                 CallbackQueryHandler(admin_panel_open, pattern="^admin_panel$"),
             ],
+            FILE_REWRITE_WAIT_FILE: [
+                MessageHandler(filters.Document.ALL, process_document_rewrite),
+                CallbackQueryHandler(start, pattern="^back_to_main_menu$"),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
         allow_reentry=True, persistent=True, name="main_conversation"
@@ -1457,4 +1548,4 @@ def main() -> None:
     app.run_polling()
 
 if __name__ == "__main__":
-    main 
+    main()

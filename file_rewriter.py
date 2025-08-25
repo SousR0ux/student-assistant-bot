@@ -2,286 +2,289 @@
 
 from __future__ import annotations
 
-import io
-import re
 from dataclasses import dataclass
-from typing import List, Tuple, Callable, Awaitable, TYPE_CHECKING, Any, Dict
+from typing import List, Tuple, Callable, Awaitable, Optional, Any, TYPE_CHECKING
+import io
+from collections import Counter
 
-# --- Опциональный импорт python-docx (чтобы не падать на типизации в редакторе) ---
+# ------------------------- docx imports (без ругани Pylance) -------------------------
 try:
-    import docx  # type: ignore
-    from docx.enum.text import WD_COLOR_INDEX  # type: ignore
-except Exception:  # библиотека может быть не установлена в среде проверки типов
-    docx = None            # type: ignore
+    import docx  # python-docx
+    from docx.enum.text import WD_COLOR_INDEX
+except ImportError:  # библиотека не установлена — дадим понятную ошибку позднее
+    docx = None  # type: ignore
     WD_COLOR_INDEX = None  # type: ignore
 
 if TYPE_CHECKING:
-    from docx.document import Document as DocxDocument  # type: ignore
-    from docx.text.run import Run  # type: ignore
+    from docx.document import Document as DocxDocument
+    from docx.text.paragraph import Paragraph
+    from docx.text.run import Run
 else:
-    DocxDocument = Any  # безопасная подстановка, чтобы Pylance не ругался
-    Run = Any
+    DocxDocument = Any  # type: ignore
+    Paragraph = Any  # type: ignore
+    Run = Any  # type: ignore
 
 
-# =========================
-#        МОДЕЛИ
-# =========================
+# ================================== DATA ==================================
 
 @dataclass
 class HighlightedPart:
-    """
-    Один выделенный (подсвеченный) пользователем фрагмент документа.
-    aggregated_text  — исходный текст фрагмента (в порядке прохождения Run-ов).
-    run_indices      — список пар (p_idx, r_idx) того, в каких параграфах/раннах лежал текст.
-    """
-    aggregated_text: str
+    """Фрагмент, выделенный заливкой (желтой), собранный из нескольких runs."""
+    original_text: str
     part_index: int
-    run_indices: List[Tuple[int, int]]
+    run_indices: List[Tuple[int, int]]  # список (paragraph_index, run_index)
 
 
 @dataclass
 class RewrittenPart:
-    """Результат рерайта для одного HighlightedPart."""
+    """Результат рерайта определенного фрагмента."""
     rewritten_text: str
     original_part: HighlightedPart
 
 
-# =========================
-#     ВСПОМОГАТЕЛЬНОЕ
-# =========================
-
-def _is_yellow_highlight(run: Run) -> bool:
-    """Проверка, что у ранна жёлтая подсветка. Защита от отсутствия атрибута."""
-    try:
-        return getattr(run.font, "highlight_color", None) == getattr(WD_COLOR_INDEX, "YELLOW", None)
-    except Exception:
-        return False
-
-
-def _chunk_text(text: str, max_chars: int = 8000) -> List[str]:
-    """Ровняем по кускам, чтобы не превышать лимиты модели."""
-    text = text.strip()
-    if len(text) <= max_chars:
-        return [text]
-    return [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
-
-
-def _build_prompt(chunk: str, tone: str, target_uniqueness: str, deep_analyze: bool = True) -> str:
-    """Жёсткий промпт: анализ смысла + запрет на подмену категорий и фактов."""
-    uniq_line = f"Цель по уникальности (антиплагиат): {target_uniqueness}.\n" if target_uniqueness else ""
-    analyze = (
-        "<self_reflection>\n"
-        "1) Подумай, какие требования к идеальному академическому перефразированию важны.\n"
-        "2) Внутренне оцени результат по 6 критериям: точность смысла, сохранение категорий/терминов, "
-        "отсутствие новых фактов, структурное соответствие (1↔1 по предложениям), связность, естественность стиля.\n"
-        "3) Если какой-либо критерий не выполнен, перепиши свой ответ до соответствия.\n"
-        "</self_reflection>\n\n"
-        if deep_analyze else ""
-    )
-    return (
-        "Ты — опытный академический редактор. Твоя задача — осторожно перефразировать текст "
-        "без искажения смысла и без добавления фактов.\n\n"
-        "<rules>\n"
-        "- Переписывай СТРОГО предложение-за-предложением: на каждое входное предложение — одно переписанное.\n"
-        "- Не меняй категории и заголовки: «Актуальность», «Цель курсовой работы», «Объект исследования», "
-        "«Предмет исследования», «Задачи» и т. п. НЕЛЬЗЯ заменять «цель» на «предмет» и наоборот.\n"
-        "- Сохраняй имена, цифры, хронологию, термины. Ничего не выдумывай и не добавляй.\n"
-        f"- Стиль: {tone}. Объём каждого предложения ~0.8–1.2 от исходного.\n"
-        "- Не пиши никаких комментариев, пояснений, списков правил и т. д. Выводи только перефразированный текст.\n"
-        f"- {uniq_line}"
-        "</rules>\n\n"
-        f"{analyze}"
-        "ТЕКСТ ДЛЯ РЕРАЙТА:\n"
-        f"\"\"\"\n{chunk}\n\"\"\"\n\n"
-        "ВЫВОД: только перефразированный текст без меток и комментариев."
-    )
-
-
-def _clean_model_text(s: str) -> str:
-    """Убираем маркдауны/обёртки, лишние пробелы."""
-    s = s.strip()
-    # удаляем возможные бэктики/код-блоки
-    s = s.strip("`").strip()
-    # нормализуем множественные пробелы
-    s = re.sub(r"[ \t]+", " ", s)
-    # убираем пробелы перед знаками препинания
-    s = re.sub(r"\s+([,.;:!?])", r"\1", s)
-    return s.strip()
-
-
-# =========================
-#   ОСНОВНЫЕ ФУНКЦИИ
-# =========================
+# ============================ PARSE HIGHLIGHT ==============================
 
 def process_docx_for_rewrite(file_bytes: bytes) -> Tuple[DocxDocument, List[HighlightedPart]]:
     """
-    Считывает .docx, находит непрерывные последовательности Run-ов с жёлтой подсветкой
-    и возвращает документ + список выделенных фрагментов.
+    Открывает .docx и находит фрагменты, выделенные заливкой YELLOW.
+    Возвращает сам документ и список выделенных частей (в порядке следования).
     """
     if docx is None:
-        raise RuntimeError("Библиотека python-docx не установлена. Установите: pip install python-docx")
+        raise RuntimeError("Библиотека python-docx не установлена. Выполните: pip install python-docx")
 
-    doc: DocxDocument = docx.Document(io.BytesIO(file_bytes))  # type: ignore
-    parts: List[HighlightedPart] = []
+    document: DocxDocument = docx.Document(io.BytesIO(file_bytes))  # type: ignore[call-arg]
+    highlighted: List[HighlightedPart] = []
 
-    current_runs: List[Tuple[int, int]] = []
     current_text: List[str] = []
-    part_counter = 0
+    current_runs: List[Tuple[int, int]] = []
+    part_idx = 0
 
-    for p_idx, p in enumerate(doc.paragraphs):
-        for r_idx, run in enumerate(p.runs):
-            if _is_yellow_highlight(run):
-                current_runs.append((p_idx, r_idx))
-                current_text.append(run.text or "")
+    for p_i, p in enumerate(document.paragraphs):
+        for r_i, run in enumerate(p.runs):
+            is_hl = (getattr(run.font, "highlight_color", None) == getattr(WD_COLOR_INDEX, "YELLOW", None))
+            if is_hl:
+                current_text.append(run.text)
+                current_runs.append((p_i, r_i))
             else:
                 if current_runs:
-                    parts.append(
+                    highlighted.append(
                         HighlightedPart(
-                            aggregated_text="".join(current_text),
-                            part_index=part_counter,
+                            original_text="".join(current_text),
+                            part_index=part_idx,
                             run_indices=current_runs[:],
                         )
                     )
-                    part_counter += 1
-                    current_runs.clear()
+                    part_idx += 1
                     current_text.clear()
+                    current_runs.clear()
 
-    # Хвост
+    # хвост
     if current_runs:
-        parts.append(
+        highlighted.append(
             HighlightedPart(
-                aggregated_text="".join(current_text),
-                part_index=part_counter,
+                original_text="".join(current_text),
+                part_index=part_idx,
                 run_indices=current_runs[:],
             )
         )
 
-    return doc, parts
+    return document, highlighted
 
+
+# ============================ PROMPTS / UTILS ==============================
+
+def _chunk_text(text: str, max_chars: int = 8000) -> List[str]:
+    s = (text or "").strip()
+    if len(s) <= max_chars:
+        return [s]
+    return [s[i:i + max_chars] for i in range(0, len(s), max_chars)]
+
+
+def _build_prompt(
+    chunk: str,
+    tone: str,
+    target_uniqueness: str,
+    deep_analyze: bool = True
+) -> str:
+    """
+    Инструкции «внутри промпта»:
+    - сначала (мысленно) анализ смысла, затем рерайт;
+    - только перефразированный текст на выходе, без пояснений/списков/предисловий.
+    - под антиплагиат: синтаксические перестройки, синонимизация, изменение порядка, но без «воды».
+    """
+    uniq_line = f"Цель по проверке оригинальности (антиплагиат): {target_uniqueness}.\n" if target_uniqueness else ""
+    analyze = (
+        "Сначала мысленно выдели ключевые идеи, термины и логические связи, чтобы понять смысл. "
+        "Не показывай ход анализа пользователю. Затем перефразируй.\n"
+        if deep_analyze else ""
+    )
+
+    return (
+        "Ты — академический редактор на русском. Перепиши фрагмент строго по правилам:\n"
+        f"{analyze}"
+        f"- стиль: {tone};\n"
+        "- сохрани исходную мысль, структуру абзацев и порядок смысловых блоков;\n"
+        "- не добавляй списки/заголовки/вводные, если их нет в тексте;\n"
+        "- не вставляй выводы, пояснения, комментарии, метатекст;\n"
+        "- перефразируй так, чтобы снизить совпадения: меняй синтаксис, перестраивай фразы, используй синонимы, "
+        "инвертируй порядок, дроби/сливай предложения — но без потери смысла;\n"
+        "- избегай шаблонов ИИ, штампов и речевых клише; соблюдай академическую норму русского языка;\n"
+        f"{uniq_line}"
+        "ВЫВЕДИ ТОЛЬКО перефразированный текст, без кавычек, без пояснений.\n\n"
+        "ТЕКСТ:\n"
+        f"{chunk}"
+    )
+
+
+def _is_ai_error_text(s: str) -> bool:
+    """Эвристика: похоже ли это на сообщение об ошибке/квоте/перегрузке?"""
+    s = (s or "").strip()
+    if not s:
+        return True
+    low = s.lower()
+    return any(kw in low for kw in (
+        "ошибка", "не удалось", "недоступен", "перегруз", "quota", "rate limit",
+        "429", "api key", "try again", "попробуйте позже"
+    ))
+
+
+# =========================== REWRITE PIPELINE ==============================
 
 async def rewrite_highlighted_parts_async(
     parts: List[HighlightedPart],
     rewrite_fn: Callable[[str], Awaitable[str]],
-    tone: str = "официальный",
-    target_uniqueness: str = "",
+    tone: str,
+    target_uniqueness: str,
     deep_analyze: bool = True,
 ) -> List[RewrittenPart]:
     """
-    Делит исходные тексты по кускам (на случай больших фрагментов),
-    вызывает переданную функция `rewrite_fn(prompt)`, склеивает результат.
+    Для каждой выделенной части вызывает ИИ. Если ИИ вернул ошибку — оставляем исходный текст.
     """
     out: List[RewrittenPart] = []
 
     for part in parts:
-        src = part.aggregated_text.strip()
-        if not src:
+        src = part.original_text or ""
+        if not src.strip():
             continue
 
         chunks = _chunk_text(src)
-        rewritten_total: List[str] = []
+        rewritten_chunks: List[str] = []
 
-        for chunk in chunks:
-            prompt = _build_prompt(chunk, tone, target_uniqueness, deep_analyze=deep_analyze)
-            resp = await rewrite_fn(prompt)
-            rewritten_total.append(_clean_model_text(resp))
+        for ch in chunks:
+            prompt = _build_prompt(ch, tone=tone, target_uniqueness=target_uniqueness, deep_analyze=deep_analyze)
+            resp = (await rewrite_fn(prompt)).strip()
+
+            if _is_ai_error_text(resp):
+                # ИИ не смог — возвращаем исходный кусок без изменений
+                rewritten_chunks.append(ch)
+            else:
+                # убираем возможные бэктики/служебные символы
+                rewritten_chunks.append(resp.strip("`").strip())
 
         out.append(
             RewrittenPart(
-                rewritten_text=" ".join(rewritten_total).strip(),
-                original_part=part,
+                rewritten_text=" ".join(rewritten_chunks).strip(),
+                original_part=part
             )
         )
 
     return out
 
 
-def _distribute_text_by_runs(text: str, runs: List[Run]) -> List[str]:
+# ============================== APPLY BACK ================================
+
+def _majority_style_attrs(original_doc: DocxDocument, run_refs: List[Tuple[int, int]]) -> dict:
     """
-    Возвращает список частей `text`, распределённых по раннам пропорционально
-    их первоначальной длине. Это позволяет сохранить формат конкретных раннов
-    (жирность/курсив/капс и т. п.), не делая весь блок одним стилем.
+    Берём преобладающие атрибуты шрифта на выделенном участке — чтобы не сделать весь абзац жирным,
+    если только первый run был жирным.
     """
-    if not runs:
-        return []
+    bold_vals: List[Optional[bool]] = []
+    italic_vals: List[Optional[bool]] = []
+    underline_vals: List[Optional[bool]] = []
+    sizes: List[Any] = []  # длина (EMU) из python-docx, тип оставляем Any
 
-    # исходные длины
-    lengths = [len(r.text or "") for r in runs]
-    total_len = sum(lengths)
+    for p_i, r_i in run_refs:
+        run: Run = original_doc.paragraphs[p_i].runs[r_i]
+        bold_vals.append(run.bold)
+        italic_vals.append(run.italic)
+        underline_vals.append(run.underline)
+        if run.font and run.font.size:
+            sizes.append(run.font.size)
 
-    # если все длины нулевые — просто сверху вниз
-    if total_len == 0:
-        parts = []
-        left = text
-        for i in range(len(runs) - 1):
-            parts.append("")  # ничего не было — ничего не кладём
-        parts.append(left)
-        return parts
+    def _maj(lst: List[Optional[bool]]) -> Optional[bool]:
+        # считаем только True/False; None трактуем как отсутствие явной установки
+        vals = [v for v in lst if isinstance(v, bool)]
+        if not vals:
+            return None
+        cnt = Counter(vals)
+        # если большинство False — возвращаем False, иначе True
+        return cnt.most_common(1)[0][0]
 
-    target_total = len(text)
-    assigned: List[int] = []
-    taken = 0
-    for i, L in enumerate(lengths):
-        if i == len(lengths) - 1:
-            size = target_total - taken
-        else:
-            # доля символов
-            share = (L / total_len) * target_total
-            size = max(0, int(round(share)))
-            # не превышаем остаток
-            size = min(size, target_total - taken)
-        assigned.append(size)
-        taken += size
+    def _mode(lst: List[Any]) -> Optional[Any]:
+        return Counter(lst).most_common(1)[0][0] if lst else None
 
-    # Срезы текста
-    res: List[str] = []
-    pos = 0
-    for size in assigned:
-        res.append(text[pos:pos + size])
-        pos += size
-    return res
+    return {
+        "bold": _maj(bold_vals),
+        "italic": _maj(italic_vals),
+        "underline": _maj(underline_vals),
+        "size": _mode(sizes),
+    }
 
 
 def build_final_docx(original_doc: DocxDocument, rewritten_parts: List[RewrittenPart]) -> bytes:
     """
-    Вставляет переписанный текст на место подсвеченных участков,
-    снимает подсветку, при этом:
-    - количество раннов и их стили сохраняются;
-    - жирность/курсив/капс/шрифт/интервалы/отступы/стили абзацев НЕ меняются.
+    Вставляет переписанные фрагменты:
+    - если текст не изменился (или была ошибка ИИ) — ничего не трогаем;
+    - если изменился — подставляем в первый run участка новый текст, сбрасываем подсветку
+      и ставим преобладающие атрибуты шрифта (bold/italic/underline/size), чтобы не ломать оформление.
+    Остальные runs в участке очищаем.
     """
-    # Быстрый доступ по номеру фрагмента
-    parts_map: Dict[int, RewrittenPart] = {
-        p.original_part.part_index: p for p in rewritten_parts
-    }
+    parts_map = {p.original_part.part_index: p for p in rewritten_parts}
 
-    for part_idx in sorted(parts_map.keys()):
-        part = parts_map[part_idx]
-        indices = part.original_part.run_indices
+    for part in parts_map.values():
+        orig = (part.original_part.original_text or "").strip()
+        new = (part.rewritten_text or "").strip()
 
-        # Собираем реальные ранны в исходном порядке
-        runs: List[Run] = []
-        for p_idx, r_idx in indices:
-            try:
-                runs.append(original_doc.paragraphs[p_idx].runs[r_idx])  # type: ignore
-            except Exception:
-                # если вдруг индекс «уехал», пропускаем
-                continue
-
-        if not runs:
+        # Ничего не меняем, если реального рерайта нет
+        if not new or new == orig:
             continue
 
-        # Распределяем новый текст по этим же раннам
-        slices = _distribute_text_by_runs(part.rewritten_text, runs)
+        # Куда вставлять
+        if not part.original_part.run_indices:
+            continue
+        p0, r0 = part.original_part.run_indices[0]
+        first_run: Run = original_doc.paragraphs[p0].runs[r0]
 
-        for run, new_text in zip(runs, slices):
-            # подчищаем подсветку и меняем только текст
+        # выставим преобладающие атрибуты стиля на участке
+        style = _majority_style_attrs(original_doc, part.original_part.run_indices)
+
+        # вставка текста + аккуратный стиль
+        first_run.text = new
+        if getattr(first_run, "font", None) is not None:
             try:
-                if getattr(run.font, "highlight_color", None) is not None:
-                    run.font.highlight_color = None
+                first_run.font.highlight_color = None
             except Exception:
                 pass
-            run.text = new_text
 
+        # атрибуты run уровня (bold/italic/underline)
+        if style["bold"] is not None:
+            first_run.bold = style["bold"]
+        if style["italic"] is not None:
+            first_run.italic = style["italic"]
+        if style["underline"] is not None:
+            first_run.underline = style["underline"]
+        if style["size"] is not None and getattr(first_run, "font", None) is not None:
+            first_run.font.size = style["size"]
+
+        # очищаем остальные runs участка
+        for i, (p_i, r_i) in enumerate(part.original_part.run_indices):
+            if i == 0:
+                continue
+            run_to_clear: Run = original_doc.paragraphs[p_i].runs[r_i]
+            run_to_clear.text = ""
+
+    # финальный байтовый docx
     bio = io.BytesIO()
-    original_doc.save(bio)  # type: ignore
+    original_doc.save(bio)
     bio.seek(0)
     return bio.getvalue()

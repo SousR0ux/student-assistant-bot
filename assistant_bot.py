@@ -237,93 +237,119 @@ def _feature_usage_today(bd: dict) -> Dict[str, int]:
     return {"rewriter": int(fm.get("rewriter", 0)), "literature": int(fm.get("literature", 0)), "file_rewrite": int(fm.get("file_rewrite", 0))}
 
 # ===== Gemini =====
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-GEMINI_FALLBACK_MODELS = [
-    m.strip() for m in os.getenv(
-        "GEMINI_FALLBACK_MODELS",
-        "gemini-1.5-pro, gemini-1.0-pro"
-    ).split(",")
-    if m.strip()
-    if m.strip() != GEMINI_MODEL
-]
-GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
-GEMINI_BACKOFF_BASE = float(os.getenv("GEMINI_BACKOFF_BASE", "1.5"))
+# GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+# GEMINI_FALLBACK_MODELS = [
+#     m.strip() for m in os.getenv(
+#         "GEMINI_FALLBACK_MODELS",
+#         "gemini-1.5-pro, gemini-1.0-pro"
+#     ).split(",")
+#     if m.strip()
+#     if m.strip() != GEMINI_MODEL
+# ]
+# GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
+# GEMINI_BACKOFF_BASE = float(os.getenv("GEMINI_BACKOFF_BASE", "1.5"))
 
-async def call_gemini(prompt: str) -> str:
-    """
-    Вызов Gemini с повторными попытками и запасными моделями.
-    Возвращает чистый текст ответа (или понятное сообщение об ошибке).
-    """
-    if not GEMINI_API_KEY:
-        return "Ошибка: API-ключ для нейросети не настроен."
+# async def call_gemini(prompt: str) -> str:
+#     """
+#     Вызов Gemini с повторными попытками и запасными моделями.
+#     Возвращает чистый текст ответа (или понятное сообщение об ошибке).
+#     """
+#     if not GEMINI_API_KEY:
+#         return "Ошибка: API-ключ для нейросети не настроен."
 
-    from httpx import AsyncClient, HTTPStatusError, ConnectError, ReadTimeout
+#     from httpx import AsyncClient, HTTPStatusError, ConnectError, ReadTimeout
 
-    async def _try_call(model: str) -> tuple[bool, str]:
-        """True, text — успех; False, text — ошибка (ретраибл/неретраибл)."""
-        api_url = (
-            f"https://generativelanguage.googleapis.com/v1/models/"
-            f"{model}:generateContent?key={GEMINI_API_KEY}"
+#     async def _try_call(model: str) -> tuple[bool, str]:
+#         """True, text — успех; False, text — ошибка (ретраибл/неретраибл)."""
+#         api_url = (
+#             f"https://generativelanguage.googleapis.com/v1/models/"
+#             f"{model}:generateContent?key={GEMINI_API_KEY}"
+#         )
+#         payload = {
+#             "contents": [{
+#                 "role": "user",
+#                 "parts": [{"text": prompt}]
+#             }]
+#         }
+#         try:
+#             async with AsyncClient(timeout=60.0) as client:
+#                 r = await client.post(api_url, json=payload)
+
+#                 # Квота/частотный лимит — пробуем ретрай/фолбэк
+#                 if r.status_code == 429:
+#                     return False, "quota_or_rate"
+
+#                 # 5xx — временные проблемы на стороне сервиса
+#                 if 500 <= r.status_code < 600:
+#                     return False, f"server_{r.status_code}"
+
+#                 r.raise_for_status()
+#                 j = r.json()
+#                 cand = j.get("candidates", [])
+#                 if cand and cand[0].get("content", {}).get("parts"):
+#                     text = cand[0]["content"]["parts"][0].get("text", "").strip()
+#                     if text:
+#                         return True, text
+#                 return False, "empty_answer"
+
+#         except (HTTPStatusError, ConnectError, ReadTimeout):
+#             # Сетевые/HTTP сбои — ретраибл
+#             return False, "network_error"
+#         except Exception as e:
+#             # Прочие — считаем неретраибл и возвращаем текст
+#             return True, f"Произошла ошибка при обращении к нейросети: {e}"
+
+#     # Порядок: основная модель + запасные
+#     models_chain = [GEMINI_MODEL] + GEMINI_FALLBACK_MODELS
+
+#     for model in models_chain:
+#         for attempt in range(GEMINI_MAX_RETRIES):
+#             ok, text = await _try_call(model)
+#             if ok:
+#                 return text
+
+#             # Ретраим только ретраибл-коды
+#             if text in ("quota_or_rate", "network_error") or text.startswith("server_"):
+#                 # экспоненциальный бэкофф с небольшим джиттером
+#                 delay = (GEMINI_BACKOFF_BASE ** attempt) + random.uniform(0, 0.6)
+#                 await asyncio.sleep(delay)
+#                 continue
+#             else:
+#                 # Неретраибл кейс: возвращаем сообщение как есть
+#                 return text
+
+#         # Переходим к запасной модели
+#         continue
+
+#     # Если всё перепробовали
+#     return ("Сервис ИИ временно недоступен (квоты/перегрузка). "
+#             "Попробуйте позже или свяжитесь с поддержкой: @V_L_A_D_IS_L_A_V")
+
+# ===== OpenAI (ChatGPT) =====
+from openai import AsyncOpenAI
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+_openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+async def call_openai(prompt: str) -> str:
+    if not OPENAI_API_KEY:
+        return "Ошибка: OpenAI API ключ не задан (переменная OPENAI_API_KEY)."
+    try:
+        resp = await _openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system",
+                 "content": ("Ты академический редактор. Переписывай текст без добавления новых фактов; "
+                             "сохраняй смысл, структуру, нумерацию и формат; не добавляй вступлений/выводов; "
+                             "избегай воды и клише; не меняй единицы измерения; списки — сохраняй.")},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3
         )
-        payload = {
-            "contents": [{
-                "role": "user",
-                "parts": [{"text": prompt}]
-            }]
-        }
-        try:
-            async with AsyncClient(timeout=60.0) as client:
-                r = await client.post(api_url, json=payload)
-
-                # Квота/частотный лимит — пробуем ретрай/фолбэк
-                if r.status_code == 429:
-                    return False, "quota_or_rate"
-
-                # 5xx — временные проблемы на стороне сервиса
-                if 500 <= r.status_code < 600:
-                    return False, f"server_{r.status_code}"
-
-                r.raise_for_status()
-                j = r.json()
-                cand = j.get("candidates", [])
-                if cand and cand[0].get("content", {}).get("parts"):
-                    text = cand[0]["content"]["parts"][0].get("text", "").strip()
-                    if text:
-                        return True, text
-                return False, "empty_answer"
-
-        except (HTTPStatusError, ConnectError, ReadTimeout):
-            # Сетевые/HTTP сбои — ретраибл
-            return False, "network_error"
-        except Exception as e:
-            # Прочие — считаем неретраибл и возвращаем текст
-            return True, f"Произошла ошибка при обращении к нейросети: {e}"
-
-    # Порядок: основная модель + запасные
-    models_chain = [GEMINI_MODEL] + GEMINI_FALLBACK_MODELS
-
-    for model in models_chain:
-        for attempt in range(GEMINI_MAX_RETRIES):
-            ok, text = await _try_call(model)
-            if ok:
-                return text
-
-            # Ретраим только ретраибл-коды
-            if text in ("quota_or_rate", "network_error") or text.startswith("server_"):
-                # экспоненциальный бэкофф с небольшим джиттером
-                delay = (GEMINI_BACKOFF_BASE ** attempt) + random.uniform(0, 0.6)
-                await asyncio.sleep(delay)
-                continue
-            else:
-                # Неретраибл кейс: возвращаем сообщение как есть
-                return text
-
-        # Переходим к запасной модели
-        continue
-
-    # Если всё перепробовали
-    return ("Сервис ИИ временно недоступен (квоты/перегрузка). "
-            "Попробуйте позже или свяжитесь с поддержкой: @V_L_A_D_IS_L_A_V")
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        return f"Произошла ошибка при обращении к нейросети: {e}"
 
 
 def _no_literature_found(txt: str) -> bool:
@@ -1396,7 +1422,7 @@ async def rewriter_process_text(update: Update, context: ContextTypes.DEFAULT_TY
         "улучши связность; числа в финчасти частично/полностью словами; без вступлений. \n\n"
         f"Исходный текст:\n\"\"\"\n{user_text}\n\"\"\""
     )
-    txt = await call_gemini(prompt)
+    txt = await call_openai(prompt)
 
     success = not (txt.startswith("Ошибка") or "Не удалось получить корректный ответ" in txt)
     _record_ai_stat(context.application, success)
@@ -1441,7 +1467,7 @@ async def literature_process_topic(update: Update, context: ContextTypes.DEFAULT
         f"Тема: «{topic}»\n"
         "Не добавляй ссылки/URL и лишние прелюдии/итоги."
     )
-    txt = await call_gemini(prompt)
+    txt = await call_openai(prompt)
     success = not _no_literature_found(txt)
     _record_ai_stat(context.application, success)
 
@@ -1519,7 +1545,7 @@ async def process_document_rewrite(update: Update, context: ContextTypes.DEFAULT
 
         rewritten_parts = await rewrite_highlighted_parts_async(
             highlighted_parts,
-            rewrite_fn=call_gemini,
+            rewrite_fn=call_openai,
             tone=context.user_data.get("tone", "официальный"),
             target_uniqueness="85-95%"
         )

@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
     ADMIN_BLACKLIST_WAIT_ID, ADMIN_SHADOW_WAIT_ID,
     ADMIN_METRICS_MENU,
     FILE_REWRITE_WAIT_FILE,
-    ADMIN_ADDSUB_FILE_WAIT_ID, ADMIN_ADDSUB_FILE_WAIT_DAYS
+    ADMIN_ADDSUB_FILE_WAIT_ID, ADMIN_ADDSUB_FILE_WAIT_DAYS, ADMIN_MAINT_MSG_WAIT
 ) = range(28)
 
 # ===== HELPERS: dates/roles =====
@@ -198,6 +198,37 @@ def _gen_captcha(context: ContextTypes.DEFAULT_TYPE) -> str:
     a, b = random.randint(2, 9), random.randint(2, 9)
     context.user_data["captcha_answer"] = str(a + b)
     return f"Проверка: сколько будет {a} + {b}? Отправьте ответ числом."
+
+# ===== Maintenance mode (техработы) =====
+MAINTENANCE_DEFAULT_MSG = (
+    "🛠 <b>Сервис временно на техработах</b>.\n"
+    "Попробуйте позже. Если вопрос срочный — напишите автору: "
+    "<a href='https://t.me/V_L_A_D_IS_L_A_V'>@V_L_A_D_IS_L_A_V</a>"
+)
+
+def _maintenance_on(app: Application) -> bool:
+    return bool(app.bot_data.get("maintenance_enabled", False))
+
+def _maintenance_text(app: Application) -> str:
+    txt = app.bot_data.get("maintenance_msg")
+    return txt if (isinstance(txt, str) and txt.strip()) else MAINTENANCE_DEFAULT_MSG
+
+async def _maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Вернёт True, если НУЖНО остановить действие из-за техработ."""
+    if _maintenance_on(context.application) and not is_admin(update.effective_user.id):
+        msg = _maintenance_text(context.application)
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.message.edit_text(
+                msg, parse_mode="HTML", reply_markup=contact_kb(), disable_web_page_preview=True
+            )
+        else:
+            await update.effective_message.reply_html(
+                msg, reply_markup=contact_kb(), disable_web_page_preview=True
+            )
+        return True
+    return False
+
 
 # ===== Analytics core =====
 def _track_active(app: Application, uid: int) -> None:
@@ -409,6 +440,8 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("👻 Теневой бан", callback_data="admin_shadow")],
         [InlineKeyboardButton("🎚 Задать лимиты", callback_data="admin_setlimit"),
          InlineKeyboardButton("📈 Метрики", callback_data="admin_metrics")],
+         [InlineKeyboardButton("🛠 Техработы: вкл/выкл", callback_data="admin_maint_toggle"),
+          InlineKeyboardButton("📝 Текст техработ", callback_data="admin_maint_msg")],
         [InlineKeyboardButton("⬅️ Назад в главное меню", callback_data="back_to_main_menu")],
     ])
 
@@ -692,6 +725,45 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"• Рерайтер: {r} из {FREE_LIMIT}\n"
             f"• Литература: {l} из {FREE_LIMIT}"
         )
+
+# ===== ADMIN: Maintenance =====
+async def admin_maint_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        await update.callback_query.answer("Только администратор.", show_alert=True)
+        return ADMIN_MENU
+    await update.callback_query.answer()
+    cur = _maintenance_on(context.application)
+    context.application.bot_data["maintenance_enabled"] = not cur
+    status = "ВКЛЮЧЕН" if not cur else "выключен"
+    txt = f"🛠 Режим техработ: <b>{status}</b>.\n\nТекст для пользователей:\n{_maintenance_text(context.application)}"
+    await update.callback_query.message.edit_text(txt, parse_mode="HTML",
+                                                  reply_markup=admin_menu_kb(),
+                                                  disable_web_page_preview=True)
+    return ADMIN_MENU
+
+async def admin_maint_msg_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        await update.callback_query.answer("Только администратор.", show_alert=True)
+        return ADMIN_MENU
+    await update.callback_query.answer()
+    await update.callback_query.message.edit_text(
+        "Введите <b>новый текст</b> сообщения для техработ (HTML разрешён, до ~1000 символов).",
+        parse_mode="HTML", reply_markup=admin_cancel_kb()
+    )
+    return ADMIN_MAINT_MSG_WAIT
+
+async def admin_maint_msg_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Только администратор.")
+        return ADMIN_MENU
+    txt = (update.message.text or "").strip()
+    if not txt:
+        await update.message.reply_text("Пусто. Текст не изменён.", reply_markup=admin_cancel_kb())
+        return ADMIN_MENU
+    context.application.bot_data["maintenance_msg"] = txt[:1000]
+    await update.message.reply_html("✅ Текст техработ сохранён.", reply_markup=admin_cancel_kb())
+    return ADMIN_MENU
+
 
 # ===== ADMIN PANEL (callbacks + flows) =====
 async def admin_panel_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1359,44 +1431,90 @@ SIGNATURE_MD = (
     "➡️ *[Свяжитесь со мной](https://t.me/V_L_A_D_IS_L_A_V)*"
 )
 
+# --- START: rewriter_start с проверкой техработ ---
 async def rewriter_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query; uid = update.effective_user.id; await q.answer()
-    if _is_blacklisted(context.application, uid): await q.message.edit_text("🚫 Доступ ограничен."); return MAIN_MENU
-    if _is_shadowbanned(context.application, uid): await q.message.edit_text("Сервис перегружен."); return MAIN_MENU
+    q = update.callback_query
+    uid = update.effective_user.id
+    await q.answer()
+
+    # ⛔ техработы
+    if await _maintenance_guard(update, context):
+        return MAIN_MENU
+
+    if _is_blacklisted(context.application, uid):
+        await q.message.edit_text("🚫 Доступ ограничен.")
+        return MAIN_MENU
+    if _is_shadowbanned(context.application, uid):
+        await q.message.edit_text("Сервис перегружен.")
+        return MAIN_MENU
 
     if not is_admin(uid) and not has_active_subscription(context):
         if get_user_usage("rewriter", context) >= FREE_LIMIT:
             await q.edit_message_text(
                 ("🚫 <b>Дневной лимит исчерпан</b>\n\n"
                  "Хотите продолжить без ожидания? Напишите: <a href='https://t.me/V_L_A_D_IS_L_A_V'>@V_L_A_D_IS_L_A_V</a>\n"
-                 f"Ваш ID: <code>{uid}</code>"), parse_mode="HTML", reply_markup=contact_kb())
+                 f"Ваш ID: <code>{uid}</code>"),
+                parse_mode="HTML",
+                reply_markup=contact_kb()
+            )
             return MAIN_MENU
+
     left = remaining_attempts("rewriter", context, uid)
     await q.edit_message_text(
         ("✍️ *AI-Рерайтер*\n\nПришлите текст (до 1000 символов).\n\n"
          f"Доступно сегодня: *{left}*"),
-        parse_mode="Markdown", reply_markup=back_menu_kb())
+        parse_mode="Markdown",
+        reply_markup=back_menu_kb()
+    )
     return REWRITER_TEXT_INPUT
+# --- END: rewriter_start ---
 
+
+# --- START: literature_start с проверкой техработ ---
 async def literature_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query; uid = update.effective_user.id; await q.answer()
-    if _is_blacklisted(context.application, uid): await q.message.edit_text("🚫 Доступ ограничен."); return MAIN_MENU
-    if _is_shadowbanned(context.application, uid): await q.message.edit_text("Сервис перегружен."); return MAIN_MENU
+    q = update.callback_query
+    uid = update.effective_user.id
+    await q.answer()
+
+    # ⛔ техработы
+    if await _maintenance_guard(update, context):
+        return MAIN_MENU
+
+    if _is_blacklisted(context.application, uid):
+        await q.message.edit_text("🚫 Доступ ограничен.")
+        return MAIN_MENU
+    if _is_shadowbanned(context.application, uid):
+        await q.message.edit_text("Сервис перегружен.")
+        return MAIN_MENU
 
     if not is_admin(uid) and not has_active_subscription(context):
         if get_user_usage("literature", context) >= FREE_LIMIT:
             await q.edit_message_text(
                 ("🚫 <b>Дневной лимит исчерпан</b>\n\n"
                  "Хотите продолжить без ожидания? Напишите: <a href='https://t.me/V_L_A_D_IS_L_A_V'>@V_L_A_D_IS_L_A_V</a>\n"
-                 f"Ваш ID: <code>{uid}</code>"), parse_mode="HTML", reply_markup=contact_kb())
+                 f"Ваш ID: <code>{uid}</code>"),
+                parse_mode="HTML",
+                reply_markup=contact_kb()
+            )
             return MAIN_MENU
-    left = remaining_attempts("literature", context, uid)
-    await q.edit_message_text(("📚 *Генератор списка литературы*\n\nНапишите тему.\n\n"
-                               f"Доступно сегодня: *{left}*"),
-                              parse_mode="Markdown", reply_markup=back_menu_kb())
-    return LITERATURE_TOPIC_INPUT
 
+    left = remaining_attempts("literature", context, uid)
+    await q.edit_message_text(
+        ("📚 *Генератор списка литературы*\n\nНапишите тему.\n\n"
+         f"Доступно сегодня: *{left}*"),
+        parse_mode="Markdown",
+        reply_markup=back_menu_kb()
+    )
+    return LITERATURE_TOPIC_INPUT
+# --- END: literature_start ---
+
+
+# --- START: rewriter_process_text с проверкой техработ ---
 async def rewriter_process_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # ⛔ техработы (ставим самой первой строкой)
+    if await _maintenance_guard(update, context):
+        return REWRITER_TEXT_INPUT
+
     _touch_seen(update, context)
     uid = update.effective_user.id
     ok_rl, wait = _rate_limit_ok(context)
@@ -1409,11 +1527,13 @@ async def rewriter_process_text(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_html(
                 ("🚫 <b>Дневной лимит исчерпан</b>\n\n"
                  "Хотите продолжить без ожидания? Напишите: <a href='https://t.me/V_L_A_D_IS_L_A_V'>@V_L_A_D_IS_L_A_V</a>\n"
-                 f"Ваш ID: <code>{uid}</code>"), reply_markup=contact_kb())
+                 f"Ваш ID: <code>{uid}</code>"),
+                reply_markup=contact_kb()
+            )
             return REWRITER_TEXT_INPUT
 
     user_text = (update.message.text or "")[:2000]
-    context.user_data["last_request"] = {"feature":"rewriter","len":len(user_text),"ts":datetime.now().isoformat()}
+    context.user_data["last_request"] = {"feature": "rewriter", "len": len(user_text), "ts": datetime.now().isoformat()}
 
     processing = await update.message.reply_text("⏳ Обрабатываю…")
     tone = context.user_data.get("tone", "официальный")
@@ -1436,8 +1556,15 @@ async def rewriter_process_text(update: Update, context: ContextTypes.DEFAULT_TY
     full = f"*Готово! Вот перефразированный вариант:*\n\n{txt}{footer}\n\n{SIGNATURE_MD}"
     await _md_send_chunks(processing, full, markup=back_menu_kb())
     return REWRITER_TEXT_INPUT
+# --- END: rewriter_process_text ---
 
+
+# --- START: literature_process_topic с проверкой техработ ---
 async def literature_process_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # ⛔ техработы (самое начало)
+    if await _maintenance_guard(update, context):
+        return LITERATURE_TOPIC_INPUT
+
     _touch_seen(update, context)
     uid = update.effective_user.id
     ok_rl, wait = _rate_limit_ok(context)
@@ -1450,11 +1577,13 @@ async def literature_process_topic(update: Update, context: ContextTypes.DEFAULT
             await update.message.reply_html(
                 ("🚫 <b>Дневной лимит исчерпан</b>\n\n"
                  "Хотите продолжить без ожидания? Напишите: <a href='https://t.me/V_L_A_D_IS_L_A_V'>@V_L_A_D_IS_L_A_V</a>\n"
-                 f"Ваш ID: <code>{uid}</code>"), reply_markup=contact_kb())
+                 f"Ваш ID: <code>{uid}</code>"),
+                reply_markup=contact_kb()
+            )
             return LITERATURE_TOPIC_INPUT
 
     topic = (update.message.text or "")[:500]
-    context.user_data["last_request"] = {"feature":"literature","len":len(topic),"ts":datetime.now().isoformat()}
+    context.user_data["last_request"] = {"feature": "literature", "len": len(topic), "ts": datetime.now().isoformat()}
     processing = await update.message.reply_text("📚 Подбираю источники…")
 
     prompt = (
@@ -1468,6 +1597,7 @@ async def literature_process_topic(update: Update, context: ContextTypes.DEFAULT
         "Не добавляй ссылки/URL и лишние прелюдии/итоги."
     )
     txt = await call_openai(prompt)
+
     success = not _no_literature_found(txt)
     _record_ai_stat(context.application, success)
 
@@ -1476,7 +1606,9 @@ async def literature_process_topic(update: Update, context: ContextTypes.DEFAULT
             "😕 <b>Подходящие источники не нашлись</b>\n\n"
             "Сузьте тему (ключевые слова, годы/тип источника) или напишите мне — помогу вручную:\n"
             "<a href='https://t.me/V_L_A_D_IS_L_A_V'>@V_L_A_D_IS_L_A_V</a>",
-            parse_mode="HTML", reply_markup=contact_kb(), disable_web_page_preview=True
+            parse_mode="HTML",
+            reply_markup=contact_kb(),
+            disable_web_page_preview=True
         )
         return LITERATURE_TOPIC_INPUT
 
@@ -1489,12 +1621,18 @@ async def literature_process_topic(update: Update, context: ContextTypes.DEFAULT
     full = f"*Готово! Вот рекомендуемый список литературы:*\n\n{txt}{footer}\n\n{SIGNATURE_MD}"
     await _md_send_chunks(processing, full, markup=back_menu_kb())
     return LITERATURE_TOPIC_INPUT
+# --- END: literature_process_topic ---
+
+
 
 # ===== НОВЫЙ БЛОК: РЕРАЙТ ФАЙЛОВ =====
 async def file_rewriter_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     uid = update.effective_user.id
     await q.answer()
+
+    if await _maintenance_guard(update, context):
+        return MAIN_MENU
 
     if _is_blacklisted(context.application, uid) or _is_shadowbanned(context.application, uid):
         await q.message.edit_text("🚫 Доступ к этой функции ограничен.")
@@ -1669,6 +1807,8 @@ def main() -> None:
                 CallbackQueryHandler(admin_metrics_open, pattern="^admin_metrics$"),
                 CallbackQueryHandler(admin_panel_open, pattern="^admin_panel$"),
                 CallbackQueryHandler(start, pattern="^back_to_main_menu$"),
+                CallbackQueryHandler(admin_maint_toggle, pattern="^admin_maint_toggle$"),
+                CallbackQueryHandler(admin_maint_msg_start, pattern="^admin_maint_msg$"),
             ],
             ADMIN_RESET_WAIT_ID: [ MessageHandler(filters.TEXT & ~filters.COMMAND, admin_reset_receive_id) ],
             ADMIN_ADDSUB_WAIT_ID: [ MessageHandler(filters.TEXT & ~filters.COMMAND, admin_addsub_receive_id) ],
@@ -1697,6 +1837,9 @@ def main() -> None:
             FILE_REWRITE_WAIT_FILE: [
                 MessageHandler(filters.Document.ALL, process_document_rewrite),
                 CallbackQueryHandler(start, pattern="^back_to_main_menu$"),
+            ],
+            ADMIN_MAINT_MSG_WAIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_maint_msg_save)
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],

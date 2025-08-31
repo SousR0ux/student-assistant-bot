@@ -1422,10 +1422,10 @@ async def gost_show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return GOST_MENU
 
 # ===== TOOLS =====
-SIGNATURE_MDV2 = (
-    "---\n"
-    "ℹ️ *Инструмент предоставлен автором Владиславом.*\n"
-    "➡️ [Свяжитесь со мной](https://t.me/V_L_A_D_IS_L_A_V)"
+SIGNATURE_HTML = (
+    "<br>—<br>"
+    "ℹ️ <b>Инструмент предоставлен автором Владиславом.</b><br>"
+    "➡️ <a href='https://t.me/V_L_A_D_IS_L_A_V'>Свяжитесь со мной</a>"
 )
 
 # --- START: rewriter_start с проверкой техработ ---
@@ -1449,7 +1449,8 @@ async def rewriter_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if get_user_usage("rewriter", context) >= FREE_LIMIT:
             await q.edit_message_text(
                 ("🚫 <b>Дневной лимит исчерпан</b>\n\n"
-                 "Хотите продолжить без ожидания? Напишите: <a href='https://t.me/V_L_A_D_IS_L_A_V'>@V_L_A_D_IS_L_A_V</a>\n"
+                 "Хотите продолжить без ожидания? Напишите: "
+                 "<a href='https://t.me/V_L_A_D_IS_L_A_V'>@V_L_A_D_IS_L_A_V</a>\n"
                  f"Ваш ID: <code>{uid}</code>"),
                 parse_mode="HTML",
                 reply_markup=contact_kb()
@@ -1457,13 +1458,14 @@ async def rewriter_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return MAIN_MENU
 
     left = remaining_attempts("rewriter", context, uid)
-    safe_left = escape_markdown(left, version=2)
     text = (
-        "✍️ *AI-Рерайтер*\n\nПришлите текст \\(до 1000 символов\\)\\.\n\n"
-        f"Доступно сегодня: *{safe_left}*"
+        "✍️ <b>AI-Рерайтер</b>\n\n"
+        "Пришлите текст (до 1000 символов).\n\n"
+        f"Доступно сегодня: <b>{html.escape(left)}</b>"
     )
-    await q.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=back_menu_kb())
+    await q.edit_message_text(text, parse_mode="HTML", reply_markup=back_menu_kb())
     return REWRITER_TEXT_INPUT
+
 # --- END: rewriter_start ---
 
 
@@ -1523,14 +1525,17 @@ async def rewriter_process_text(update: Update, context: ContextTypes.DEFAULT_TY
         if get_user_usage("rewriter", context) >= FREE_LIMIT:
             await update.message.reply_html(
                 ("🚫 <b>Дневной лимит исчерпан</b>\n\n"
-                 "Хотите продолжить без ожидания? Напишите: <a href='https://t.me/V_L_A_D_IS_L_A_V'>@V_L_A_D_IS_L_A_V</a>\n"
+                 "Хотите продолжить без ожидания? Напишите: "
+                 "<a href='https://t.me/V_L_A_D_IS_L_A_V'>@V_L_A_D_IS_L_A_V</a>\n"
                  f"Ваш ID: <code>{uid}</code>"),
                 reply_markup=contact_kb()
             )
             return REWRITER_TEXT_INPUT
 
     user_text = (update.message.text or "")[:2000]
-    context.user_data["last_request"] = {"feature": "rewriter", "len": len(user_text), "ts": datetime.now().isoformat()}
+    context.user_data["last_request"] = {
+        "feature": "rewriter", "len": len(user_text), "ts": datetime.now().isoformat()
+    }
 
     processing = await update.message.reply_text("⏳ Обрабатываю…")
     tone = context.user_data.get("tone", "официальный")
@@ -1549,17 +1554,13 @@ async def rewriter_process_text(update: Update, context: ContextTypes.DEFAULT_TY
         _push_history(context, "rewriter", len(user_text))
 
     left = remaining_attempts("rewriter", context, uid)
-    safe_txt = escape_markdown(txt, version=2)
-    safe_left = escape_markdown(left, version=2)
 
-    full = (
-        "*Готово\\! Вот перефразированный вариант\\:*\n\n"
-        f"{safe_txt}\n\n"
-        f"*Доступно сегодня:* {safe_left}\n\n"
-        f"{SIGNATURE_MDV2}"
-    )
-    await _md_send_chunks(processing, full, markup=back_menu_kb())
+    header = "<b>Готово! Вот перефразированный вариант:</b>\n\n"
+    footer = f"\n\n<b>Доступно сегодня:</b> {html.escape(left)}\n\n{SIGNATURE_HTML}"
+
+    await SIGNATURE_HTML(processing, header, txt, footer, markup=back_menu_kb())
     return REWRITER_TEXT_INPUT
+
 # --- END: rewriter_process_text ---
 
 
@@ -1628,7 +1629,7 @@ async def literature_process_topic(update: Update, context: ContextTypes.DEFAULT
         "*Готово\\! Вот рекомендуемый список литературы\\:*\n\n"
         f"{safe_txt}\n\n"
         f"*Доступно сегодня:* {safe_left}\n\n"
-        f"{SIGNATURE_MDV2}"
+        f"{SIGNATURE_HTML}"
     )
     await _md_send_chunks(processing, full, markup=back_menu_kb())
     return LITERATURE_TOPIC_INPUT

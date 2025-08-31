@@ -457,24 +457,24 @@ def _split_plain(text: str, limit: int = TG_MSG_LIMIT) -> List[str]:
 
 async def _html_send_chunks(msg, header: str, body_plain: str, footer: str = "", markup=None):
     """
-    Безопасная отправка HTML: хедер -> чанки BODY (экранированные) -> последний чанк + футер.
-    Хедер/футер НЕ режем, чтобы не ломать теги.
+    Безопасная отправка HTML: если весь текст влезает — одним сообщением.
+    Иначе — хедер -> чанки BODY (экранированные) -> последний чанк + футер.
     """
     esc_body = html.escape(body_plain)
-    body_chunks = _split_plain(esc_body, TG_MSG_LIMIT)
+    full = f"{header}{esc_body}{footer}"
+    if len(full) <= TG_MSG_LIMIT:
+        await msg.edit_text(full, parse_mode="HTML",
+                            disable_web_page_preview=True, reply_markup=markup)
+        return
 
-    # 1) редактируем исходное сообщение на header + первый чанк
-    first = f"{header}{body_chunks[0]}"
-    await msg.edit_text(first, parse_mode="HTML", disable_web_page_preview=True)
-
-    # 2) середина — чистые чанки BODY
+    # Иначе дробим только BODY, не рвём header/footer
+    body_chunks = _split_plain(esc_body, TG_MSG_LIMIT - len(header) - 50)
+    await msg.edit_text(f"{header}{body_chunks[0]}",
+                        parse_mode="HTML", disable_web_page_preview=True)
     for mid in body_chunks[1:-1]:
         await msg.reply_text(mid, parse_mode="HTML", disable_web_page_preview=True)
-
-    # 3) финал — последний чанк + footer
-    last = f"{body_chunks[-1]}{footer}"
-    await msg.reply_text(last, parse_mode="HTML",
-                         disable_web_page_preview=True, reply_markup=markup)
+    await msg.reply_text(f"{body_chunks[-1]}{footer}",
+                         parse_mode="HTML", disable_web_page_preview=True, reply_markup=markup)
 
 def _progress_bar(used: int, total: int, width: int = 20) -> str:
     if total <= 0: return "░"*width + " ∞"
@@ -891,7 +891,7 @@ async def admin_addsub_file_receive_days(update: Update, context: ContextTypes.D
 
     exp = (start_date + timedelta(days=days)).strftime("%Y-%m-%d")
     ud["file_subscription_expires"] = exp
-    await update.message.reply_text(f"✅ Подписка на рерайт файлов выдана до {datetime.strptime(exp,'%Y-%m-%d').strftime('%d.%m.%Y')}.", reply_markup=admin_cancel_kb())
+    await update.message.reply_text(f"✅ Подписка на рерайт файлов выдана до {datetime.strptime(exp,'%Y-%m-%d').strftime('%d.%м.%Y')}.", reply_markup=admin_cancel_kb())
     try:
         await context.bot.send_message(chat_id=target_id, text=f"🎉 Вам активирован доступ к рерайту файлов на {days} дней.")
     except Exception:

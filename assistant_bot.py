@@ -2,7 +2,7 @@
 
 import os, io, csv, time, html, random
 import logging
-import asyncio, random  # для ретраев/бэкоффа
+import asyncio  # для ретраев/бэкоффа
 
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
@@ -13,7 +13,7 @@ from telegram.ext import (
     MessageHandler, CallbackQueryHandler, filters, PicklePersistence
 )
 from telegram.helpers import escape_markdown
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 
 # НОВЫЕ ИМПОРТЫ
 from file_rewriter import process_docx_for_rewrite, rewrite_highlighted_parts_async, build_final_docx
@@ -358,30 +358,11 @@ async def call_gemini(prompt: str) -> str:
 
 # # ===== OpenAI (ChatGPT) =====
 # from openai import AsyncOpenAI
-
 # OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 # _openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
 # async def call_openai(prompt: str) -> str:
-#     if not OPENAI_API_KEY:
-#         return "Ошибка: OpenAI API ключ не задан (переменная OPENAI_API_KEY)."
-#     try:
-#         resp = await _openai_client.chat.completions.create(
-#             model=OPENAI_MODEL,
-#             messages=[
-#                 {"role": "system",
-#                  "content": ("Ты академический редактор. Переписывай текст без добавления новых фактов; "
-#                              "сохраняй смысл, структуру, нумерацию и формат; не добавляй вступлений/выводов; "
-#                              "избегай воды и клише; не меняй единицы измерения; списки — сохраняй.")},
-#                 {"role": "user", "content": prompt},
-#             ],
-#             temperature=0.3
-#         )
-#         return (resp.choices[0].message.content or "").strip()
-#     except Exception as e:
-#         return f"Произошла ошибка при обращении к нейросети: {e}"
-
+#     ...
 
 def _no_literature_found(txt: str) -> bool:
     s = (txt or "").strip()
@@ -482,16 +463,17 @@ def _chunk_md(text: str, limit: int = TG_MD_LIMIT) -> List[str]:
     if buf: chunks.append(buf)
     return chunks or ["_пусто_"]
 
+# Отправка в MarkdownV2; считаем, что динамика уже экранирована в вызывающем коде
 async def _md_send_chunks(msg, text: str, markup=None):
     parts = _chunk_md(text, TG_MD_LIMIT)
     if len(parts) == 1:
-        await msg.edit_text(parts[0], parse_mode="Markdown",
+        await msg.edit_text(parts[0], parse_mode="MarkdownV2",
                             disable_web_page_preview=True, reply_markup=markup)
     else:
-        await msg.edit_text(parts[0], parse_mode="Markdown", disable_web_page_preview=True)
+        await msg.edit_text(parts[0], parse_mode="MarkdownV2", disable_web_page_preview=True)
         for p in parts[1:-1]:
-            await msg.reply_text(p, parse_mode="Markdown", disable_web_page_preview=True)
-        await msg.reply_text(parts[-1], parse_mode="Markdown",
+            await msg.reply_text(p, parse_mode="MarkdownV2", disable_web_page_preview=True)
+        await msg.reply_text(parts[-1], parse_mode="MarkdownV2",
                              disable_web_page_preview=True, reply_markup=markup)
 
 def _progress_bar(used: int, total: int, width: int = 20) -> str:
@@ -812,17 +794,46 @@ async def admin_addsub_receive_id(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_html(f"ID <code>{target_id}</code> принят. Введите <b>кол-во дней</b>:", reply_markup=admin_cancel_kb())
     return ADMIN_ADDSUB_WAIT_DAYS
 
+# ✅ Полностью реализовано: выдача/продление обычной подписки
 async def admin_addsub_receive_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try: days = int((update.message.text or "").strip()); assert days > 0
+    try:
+        days = int((update.message.text or "").strip()); assert days > 0
     except Exception:
-        await update.message.reply_text("Неверное число. Введите положительное целое.", reply_markup=admin_cancel_kb()); return ADMIN_ADDSUB_WAIT_DAYS
+        await update.message.reply_text("Неверное число. Введите положительное целое.", reply_markup=admin_cancel_kb())
+        return ADMIN_ADDSUB_WAIT_DAYS
+
     target_id = context.user_data.get("admin_addsub_target")
     if target_id is None:
-        await update.message.reply_text("Сессия сброшена. Повторите.", reply_markup=admin_cancel_kb()); return ADMIN_MENU
+        await update.message.reply_text("Сессия сброшена. Повторите.", reply_markup=admin_cancel_kb())
+        return ADMIN_MENU
+
     ud = context.application.user_data.get(target_id)
     if not ud:
-        await update.message.reply_text("Пользователь не найден.", reply_markup=admin_cancel_kb()); return ADMIN_MENU
-    
+        await update.message.reply_text("Пользователь не найден.", reply_markup=admin_cancel_kb())
+        return ADMIN_MENU
+
+    start_date = datetime.now().date()
+    current_exp_str = ud.get("subscription_expires")
+    if current_exp_str:
+        try:
+            current_exp_date = datetime.strptime(current_exp_str, "%Y-%m-%d").date()
+            if current_exp_date > start_date:
+                start_date = current_exp_date
+        except Exception:
+            pass
+
+    exp = (start_date + timedelta(days=days)).strftime("%Y-%m-%d")
+    ud["subscription_expires"] = exp
+    human = datetime.strptime(exp, "%Y-%m-%d").strftime("%d.%m.%Y")
+
+    await update.message.reply_text(f"✅ Подписка выдана до {human}.", reply_markup=admin_cancel_kb())
+    try:
+        await context.bot.send_message(chat_id=target_id, text=f"🎉 Вам активировали безлимит на {days} дн. (до {human}).")
+    except Exception:
+        pass
+    context.user_data.pop("admin_addsub_target", None)
+    return ADMIN_MENU
+
 # ===== НОВЫЙ БЛОК: УПРАВЛЕНИЕ ПОДПИСКОЙ НА ФАЙЛЫ (через админ-панель) =====
 async def admin_addsub_file_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
@@ -877,26 +888,6 @@ async def admin_addsub_file_receive_days(update: Update, context: ContextTypes.D
     except Exception:
         pass
         
-    context.user_data.pop("admin_addsub_target", None)
-    return ADMIN_MENU
-
-    start_date = datetime.now().date()
-    current_exp_str = ud.get("subscription_expires")
-    if current_exp_str:
-        try:
-            current_exp_date = datetime.strptime(current_exp_str, "%Y-%m-%d").date()
-            if current_exp_date > start_date:
-                start_date = current_exp_date
-        except (ValueError, TypeError):
-            pass
-            
-    exp = (start_date + timedelta(days=days)).strftime("%Y-%m-%d")
-    ud["subscription_expires"]=exp
-    await update.message.reply_text("✅ Подписка выдана.", reply_markup=admin_cancel_kb())
-    try:
-        await context.bot.send_message(chat_id=target_id, text=f"🎉 Вам активировали безлимит на {days} дней (до {datetime.strptime(exp,'%Y-%m-%d').strftime('%d.%m.%Y')}).")
-    except Exception:
-        pass
     context.user_data.pop("admin_addsub_target", None)
     return ADMIN_MENU
 
@@ -1061,7 +1052,10 @@ async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYP
         try:
             await context.bot.send_message(chat_id=uid, text=txt, disable_notification=is_silent)
             sent += 1
-            time.sleep(0.1) 
+            await asyncio.sleep(0.1)
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+            continue
         except Exception:
             continue
     await update.message.reply_text(f"Готово. Отправлено: {sent}", reply_markup=admin_cancel_kb())
@@ -1273,8 +1267,11 @@ async def cabinet_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     pr1 = _progress_bar(used_rew, total) if total else "∞"
     pr2 = _progress_bar(used_lit, total) if total else "∞"
-    pr3 = _progress_bar(used_file, FILE_REWRITE_LIMIT) if total else "∞"
-
+    # ✅ корректный индикатор file_rewrite
+    if has_file_rewrite_access(context):
+        pr3 = "∞"
+    else:
+        pr3 = _progress_bar(used_file, FILE_REWRITE_LIMIT)
 
     text = (
         "👤 <b>Личный кабинет</b>\n\n"
@@ -1425,10 +1422,10 @@ async def gost_show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return GOST_MENU
 
 # ===== TOOLS =====
-SIGNATURE_MD = (
+SIGNATURE_MDV2 = (
     "---\n"
     "ℹ️ *Инструмент предоставлен автором Владиславом.*\n"
-    "➡️ *[Свяжитесь со мной](https://t.me/V_L_A_D_IS_L_A_V)*"
+    "➡️ [Свяжитесь со мной](https://t.me/V_L_A_D_IS_L_A_V)"
 )
 
 # --- START: rewriter_start с проверкой техработ ---
@@ -1460,12 +1457,12 @@ async def rewriter_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return MAIN_MENU
 
     left = remaining_attempts("rewriter", context, uid)
-    await q.edit_message_text(
-        ("✍️ *AI-Рерайтер*\n\nПришлите текст (до 1000 символов).\n\n"
-         f"Доступно сегодня: *{left}*"),
-        parse_mode="Markdown",
-        reply_markup=back_menu_kb()
+    safe_left = escape_markdown(left, version=2)
+    text = (
+        "✍️ *AI-Рерайтер*\n\nПришлите текст \\(до 1000 символов\\)\\.\n\n"
+        f"Доступно сегодня: *{safe_left}*"
     )
+    await q.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=back_menu_kb())
     return REWRITER_TEXT_INPUT
 # --- END: rewriter_start ---
 
@@ -1499,12 +1496,12 @@ async def literature_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return MAIN_MENU
 
     left = remaining_attempts("literature", context, uid)
-    await q.edit_message_text(
-        ("📚 *Генератор списка литературы*\n\nНапишите тему.\n\n"
-         f"Доступно сегодня: *{left}*"),
-        parse_mode="Markdown",
-        reply_markup=back_menu_kb()
+    safe_left = escape_markdown(left, version=2)
+    text = (
+        "📚 *Генератор списка литературы*\n\nНапишите тему\\.\n\n"
+        f"Доступно сегодня: *{safe_left}*"
     )
+    await q.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=back_menu_kb())
     return LITERATURE_TOPIC_INPUT
 # --- END: literature_start ---
 
@@ -1552,8 +1549,15 @@ async def rewriter_process_text(update: Update, context: ContextTypes.DEFAULT_TY
         _push_history(context, "rewriter", len(user_text))
 
     left = remaining_attempts("rewriter", context, uid)
-    footer = f"\n\n*Доступно сегодня:* {left}"
-    full = f"*Готово! Вот перефразированный вариант:*\n\n{txt}{footer}\n\n{SIGNATURE_MD}"
+    safe_txt = escape_markdown(txt, version=2)
+    safe_left = escape_markdown(left, version=2)
+
+    full = (
+        "*Готово\\! Вот перефразированный вариант\\:*\n\n"
+        f"{safe_txt}\n\n"
+        f"*Доступно сегодня:* {safe_left}\n\n"
+        f"{SIGNATURE_MDV2}"
+    )
     await _md_send_chunks(processing, full, markup=back_menu_kb())
     return REWRITER_TEXT_INPUT
 # --- END: rewriter_process_text ---
@@ -1617,8 +1621,15 @@ async def literature_process_topic(update: Update, context: ContextTypes.DEFAULT
     _push_history(context, "literature", len(topic))
 
     left = remaining_attempts("literature", context, uid)
-    footer = f"\n\n*Доступно сегодня:* {left}"
-    full = f"*Готово! Вот рекомендуемый список литературы:*\n\n{txt}{footer}\n\n{SIGNATURE_MD}"
+    safe_txt = escape_markdown(txt, version=2)
+    safe_left = escape_markdown(left, version=2)
+
+    full = (
+        "*Готово\\! Вот рекомендуемый список литературы\\:*\n\n"
+        f"{safe_txt}\n\n"
+        f"*Доступно сегодня:* {safe_left}\n\n"
+        f"{SIGNATURE_MDV2}"
+    )
     await _md_send_chunks(processing, full, markup=back_menu_kb())
     return LITERATURE_TOPIC_INPUT
 # --- END: literature_process_topic ---
@@ -1647,11 +1658,11 @@ async def file_rewriter_start(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await q.edit_message_text(
         ("📄 *AI-Рерайт файла (DOCX)*\n\n"
-         "1. Откройте ваш `.docx` документ.\n"
-         "2. Выделите **жёлтым цветом** текст, который нужно переписать.\n"
-         "3. Сохраните и отправьте мне этот файл.\n\n"
+         "1\\. Откройте ваш `.docx` документ.\n"
+         "2\\. Выделите **жёлтым цветом** текст, который нужно переписать.\n"
+         "3\\. Сохраните и отправьте мне этот файл.\n\n"
          "Я перепишу только выделенные фрагменты, сохранив остальной текст и оформление."),
-        parse_mode="Markdown", reply_markup=back_menu_kb())
+        parse_mode="MarkdownV2", reply_markup=back_menu_kb())
     return FILE_REWRITE_WAIT_FILE
 
 async def process_document_rewrite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1719,7 +1730,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.exception("Unhandled exception", exc_info=context.error)
     try:
         if update and update.effective_message:
-            await update.message.reply_text("Упс! Ошибка. Попробуйте /start")
+            await update.effective_message.reply_text("Упс! Ошибка. Попробуйте /start")
     except Exception:
         pass
 
